@@ -8,6 +8,7 @@ import logging
 import asyncio
 import datetime
 import config
+from utils.synergy import SynergySystem
 
 logger = logging.getLogger('cogs.investigation')
 
@@ -196,12 +197,51 @@ class Investigation(commands.Cog):
         
         # 버튼 생성 (조건 체크 포함)
         view = InvestigationInteractionView(self, session, node)
-        await channel.send(embed=embed, view=view)
+        message = await channel.send(embed=embed, view=view)
+        view.message = message # 메시지 참조 저장
 
-    @commands.Cog.listener()
-    async def on_dice_roll(self, interaction: discord.Interaction, dice_result: int):
+        # ✅ 위험 감지 자동 판정 (각 멤버별)
+        for member_id in session.members:
+            stats = self.sheets.get_user_stats(discord_id=str(member_id))
+            if not stats:
+                continue
+            
+            db = self.bot.get_cog("Survival").db
+            user_state = db.fetch_one(
+                "SELECT current_sanity FROM user_state WHERE user_id = ?", 
+                (member_id,)
+            )
+            
+            sanity_percent = user_state[0] / 100.0 if user_state else 1.0
+            current_perception = GameLogic.calculate_current_stat(
+                stats['perception'], 
+                sanity_percent
+            )
+            
+            # 시너지 체크
+            synergies = SynergySystem.check_synergies(
+                stats['perception'], 
+                stats['intelligence'], 
+                stats['willpower']
+            )
+            
+            # 위험 감지 판정
+            target = GameLogic.calculate_target_value(current_perception)
+            target = SynergySystem.apply_synergy_bonus(target, synergies, 'danger_detection')
+            
+            if GameLogic.check_result(GameLogic.roll_dice(), target) in ["SUCCESS", "CRITICAL_SUCCESS"]:
+                # 위험 정보가 있는지 확인 (node의 메타데이터 또는 조건)
+                if node.get('is_dangerous', False) or "danger" in node.get('tags', []):
+                    user = self.bot.get_user(member_id)
+                    if user:
+                        await user.send(
+                            f"⚠️ **위험 감지!**\n"
+                            f"{node['name']}은(는) 위험해 보입니다!"
+                        )
+
+    async def process_investigation_dice(self, interaction: discord.Interaction, dice_result: int):
         """
-        stats.py의 /dice 명령어 실행 시 발생하는 이벤트
+        stats.py의 /dice 명령어에서 호출되는 메서드
         """
         user_id = interaction.user.id
         
@@ -256,6 +296,32 @@ class Investigation(commands.Cog):
             result_desc = variant.get("result_fail")
         elif result_type == "CRITICAL_FAILURE":
             result_desc = variant.get("result_crit_fail") or variant.get("result_fail")
+            
+        if result_type in ["SUCCESS", "CRITICAL_SUCCESS"]:
+            # ✅ 오염 판별 자동 판정
+            stats = self.sheets.get_user_stats(discord_id=str(user_id))
+            db = self.bot.get_cog("Survival").db
+            user_state = db.fetch_one(
+                "SELECT current_sanity FROM user_state WHERE user_id = ?", 
+                (user_id,)
+            )
+            
+            sanity_percent = user_state[0] / 100.0 if user_state else 1.0
+            current_perception = GameLogic.calculate_current_stat(
+                stats['perception'], 
+                sanity_percent
+            )
+            
+            if GameLogic.check_pollution_detection(current_perception):
+                # 아이템/장소가 오염되었는지 확인
+                is_polluted = variant.get('is_polluted', False) or "polluted" in item_data.get('tags', [])
+                
+                if is_polluted:
+                    user = interaction.user
+                    await user.send(
+                        f"🟢 **오염 감지!**\n"
+                        f"이 {item_data['name']}은(는) 오염되어 있습니다!"
+                    )
             
         # 5. 효과 적용 및 묘사 분리
         # 정규식으로 [effect] 추출
@@ -362,6 +428,67 @@ class Investigation(commands.Cog):
                     trigger_id = token.split('+')[1]
                     db.execute_query("INSERT OR REPLACE INTO world_triggers (trigger_id, active, activated_by) VALUES (?, 1, ?)", (trigger_id, user_id))
                     results.append(f"⚡ 트리거 활성화: {trigger_id}")
+
+                elif token.startswith("공포"):
+                    # 예: "공포-20"
+                    op = '+' if '+' in token else '-'
+                    base_damage = int(token.split(op)[1])
+                    
+                    # 스탯 로드
+                    stats = self.sheets.get_user_stats(discord_id=str(user_id))
+                    db = self.bot.get_cog("Survival").db
+                    user_state = db.fetch_one(
+                        "SELECT current_sanity FROM user_state WHERE user_id = ?", 
+                        (user_id,)
+                    )
+                    
+                    sanity_percent = user_state[0] / 100.0 if user_state else 1.0
+                    current_willpower = GameLogic.calculate_current_stat(
+                        stats['willpower'], 
+                        sanity_percent
+                    )
+                    
+                    # 1. 공포 저항 판정
+                    target = GameLogic.calculate_target_value(current_willpower)
+                    dice = GameLogic.roll_dice()
+                    
+                    user = self.bot.get_user(user_id)
+                    
+                    if dice >= target:
+                        # 저항 성공
+                        if user:
+                            await user.send(
+                                f"💪 **공포 저항 성공!** (주사위: {dice} / 목표: {target})\n"
+                                f"공포를 이겨냈습니다!"
+                            )
+                    
+                    # 2. 공포 피해 계산 (저항 여부와 관계없이 감소 적용 - 기획 확인 필요하지만 일단 요청대로)
+                    # 요청: "저항 성공 시"에 대한 언급 없음. 보통 저항 성공하면 피해 반감 등이지만, 
+                    # 요청 로직: "저항 여부와 관계없이 감소 적용" -> "actual_damage = calculate_fear_damage..."
+                    # 아마 저항 성공 시 데미지 경감 로직이 calculate_fear_damage에 있거나, 
+                    # 여기서는 일단 "공포 저항 성공 메시지"만 띄우고 데미지는 그대로 들어가는 듯?
+                    # 혹은 저항 성공 시 데미지가 0이 되어야 하나?
+                    # 유저 코드 예시: "2. 공포 피해 계산 (저항 여부와 관계없이 감소 적용)" 이라고 주석 있음.
+                    
+                    actual_damage = GameLogic.calculate_fear_damage(base_damage, current_willpower)
+                    
+                    # 3. 감각에 따른 정신력 피해 증폭
+                    current_perception = GameLogic.calculate_current_stat(
+                        stats['perception'], 
+                        sanity_percent
+                    )
+                    final_damage = GameLogic.calculate_sanity_damage(actual_damage, current_perception)
+                    
+                    # 4. 정신력 감소
+                    db.execute_query(
+                        "UPDATE user_state SET current_sanity = MAX(0, current_sanity - ?) WHERE user_id = ?",
+                        (final_damage, user_id)
+                    )
+                    
+                    results.append(
+                        f"😱 공포 피해: -{final_damage} 정신력 "
+                        f"(기본 {base_damage} → 의지 감소 {actual_damage} → 감각 증폭 {final_damage})"
+                    )
                     
             except Exception as e:
                 logger.error(f"Error applying effect {token}: {e}")
@@ -395,11 +522,19 @@ class GatheringView(discord.ui.View):
 
 class InvestigationInteractionView(discord.ui.View):
     def __init__(self, cog, session, node):
-        super().__init__(timeout=None)
+        super().__init__(timeout=900) # 15분
         self.cog = cog
         self.session = session
         self.node = node
+        self.message = None
         self.generate_buttons()
+
+    async def on_timeout(self):
+        """타임아웃 시 새 View 생성하여 타이머 리셋"""
+        if self.message:
+            new_view = InvestigationInteractionView(self.cog, self.session, self.node)
+            await self.message.edit(view=new_view)
+            new_view.message = self.message
 
     def generate_buttons(self):
         # 1. 하위 지역 (이동)

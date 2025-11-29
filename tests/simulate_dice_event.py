@@ -26,6 +26,11 @@ class MockBot:
     
     def add_cog(self, cog):
         self.cogs[cog.__class__.__name__] = cog
+        
+    def get_user(self, user_id):
+        user = MagicMock()
+        user.send = AsyncMock()
+        return user
 
 # Mock DB
 class MockDB:
@@ -40,7 +45,20 @@ class MockDB:
 # Mock Sheets
 class MockSheets:
     def get_user_stats(self, discord_id):
-        return {"perception": 60, "intelligence": 50}
+        return {
+            "name": "TestUser",
+            "hp": 100,
+            "sanity": 100,
+            "perception": 60,
+            "intelligence": 50,
+            "willpower": 50
+        }
+    
+    def get_item_data(self, item_name):
+        return {"name": item_name, "type": "item"}
+    
+    def get_madness_data(self, madness_id=None):
+        return [{"madness_id": "madness_1", "name": "Test Madness", "description": "Test", "effect_type": "sanity", "effect_value": -10, "recovery_difficulty": 50}]
 
 async def test_dice_listener():
     print("\n=== Testing Dice Listener & Effects ===")
@@ -77,7 +95,7 @@ async def test_dice_listener():
     dice_result = 50 # Target is ~60 (Perception) -> Success
     
     print("--- Simulating Dice Roll (50) ---")
-    await inv_cog.on_dice_roll(interaction, dice_result)
+    await inv_cog.process_investigation_dice(interaction, dice_result)
     
     # Verify
     # Check if DB queries were executed (printed)
@@ -99,6 +117,20 @@ async def test_dice_listener():
     # Since sanity changed by -5, trigger_madness_check should be called
     survival_cog.trigger_madness_check.assert_called_with(user_id)
     print("✅ Madness Check Triggered")
+
+    # Simulate Fear Effect
+    print("\n--- Testing Fear Effect ---")
+    fear_effect = "공포-20"
+    results = await inv_cog.apply_effects(user_id, fear_effect)
+    for r in results:
+        print(r)
+    
+    # Verify Fear Damage
+    # Should calculate damage based on Willpower and Perception
+    # Mock stats: Willpower 50 (default), Perception 60
+    # Base 20 -> Willpower reduction -> Perception amplification
+    
+    print("\n✅ Simulation Complete")
 
 if __name__ == "__main__":
     asyncio.run(test_dice_listener())

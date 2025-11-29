@@ -16,10 +16,188 @@ class Survival(commands.Cog):
         self.sheets = SheetsManager()
         self.daily_hunger_decay.start()
         self.daily_sanity_recovery.start()
+        self.daily_madness_recovery_check.start()
+        self.check_hunger_penalties.start()
+
+    async def check_hp_zero(self, user_id):
+        """체력 0 체크 및 실신 처리"""
+        try:
+            state = self.db.fetch_one(
+                "SELECT current_hp FROM user_state WHERE user_id = ?",
+                (user_id,)
+            )
+            
+            if state and state[0] <= 0:
+                # 행동불능 회피 판정
+                stats = self.sheets.get_user_stats(discord_id=str(user_id))
+                if not stats:
+                    return
+                
+                user_state = self.db.fetch_one(
+                    "SELECT current_sanity FROM user_state WHERE user_id = ?",
+                    (user_id,)
+                )
+                
+                sanity_percent = user_state[0] / 100.0 if user_state else 1.0
+                current_willpower = GameLogic.calculate_current_stat(
+                    stats['willpower'],
+                    sanity_percent
+                )
+                
+                if GameLogic.check_incapacitated_evasion(current_willpower):
+                    # 회피 성공: 체력 1 유지
+                    self.db.execute_query(
+                        "UPDATE user_state SET current_hp = 1 WHERE user_id = ?",
+                        (user_id,)
+                    )
+                    
+                    user = self.bot.get_user(user_id)
+                    if user:
+                        await user.send(
+                            f"💪 **의지로 버텼습니다!**\n"
+                            f"쓰러질 뻔했지만 의지력으로 견뎌냈습니다. (체력 1 유지)"
+                        )
+                else:
+                    # 행동불능 상태
+                    user = self.bot.get_user(user_id)
+                    if user:
+                        await user.send(
+                            f"💀 **실신했습니다!**\n"
+                            f"체력이 바닥나 의식을 잃었습니다. 동료의 도움이 필요합니다."
+                        )
+        except Exception as e:
+            logger.error(f"Error in check_hp_zero: {e}")
+
+    @tasks.loop(hours=24)
+    async def daily_madness_recovery_check(self):
+        """매일 광기 회복 가능성 체크"""
+        try:
+            # 광기를 가진 모든 유저
+            users_with_madness = self.db.fetch_all(
+                "SELECT DISTINCT user_id FROM user_madness"
+            )
+            
+            for (user_id,) in users_with_madness:
+                await self.check_madness_recovery(user_id)
+        except Exception as e:
+            logger.error(f"Error in daily_madness_recovery_check: {e}")
+
+    async def check_madness_recovery(self, user_id):
+        """광기 회복 조건 체크"""
+        try:
+            stats = self.sheets.get_user_stats(discord_id=str(user_id))
+            
+            if not stats:
+                return
+            
+            # 정신력 임계값: 50 + (지성 * 0.3)
+            threshold = 50 + (stats['intelligence'] * 0.3)
+            
+            user_state = self.db.fetch_one(
+                "SELECT current_sanity FROM user_state WHERE user_id = ?",
+                (user_id,)
+            )
+            
+            current_sanity = user_state[0] if user_state else 0
+            
+            if current_sanity >= threshold:
+                # 광기 목록 조회
+                madness_list = self.db.fetch_all(
+                    "SELECT id, madness_id, madness_name FROM user_madness WHERE user_id = ?",
+                    (user_id,)
+                )
+                
+                for madness_id_pk, madness_id, madness_name in madness_list:
+                    # 광기 데이터에서 난이도 조회
+                    madness_data = self.sheets.get_madness_data(madness_id)
+                    if not madness_data:
+                        continue
+                    
+                    difficulty = madness_data.get('recovery_difficulty', 0)
+                    
+                    # 회복 판정 (난이도가 높을수록 어려움)
+                    dice = GameLogic.roll_dice()
+                    
+                    if dice >= (100 - difficulty):  # 난이도 5 → 95 이상 필요
+                        # 회복 성공
+                        self.db.execute_query(
+                            "DELETE FROM user_madness WHERE id = ?",
+                            (madness_id_pk,)
+                        )
+                        
+                        user = self.bot.get_user(user_id)
+                        if user:
+                            await user.send(
+                                f"🌟 **광기 회복!**\n"
+                                f"'{madness_name}' 광기에서 벗어났습니다!"
+                            )
+        except Exception as e:
+            logger.error(f"Error in check_madness_recovery: {e}")
+
+    @tasks.loop(hours=24)
+    async def check_hunger_penalties(self):
+        """허기 0 상태 체크 및 페널티 적용"""
+        try:
+            users = self.db.fetch_all(
+                "SELECT user_id, current_hunger, hunger_zero_days FROM user_state WHERE current_hunger <= 0"
+            )
+            
+            for user_id, hunger, zero_days in users:
+                zero_days += 1
+                
+                hp_damage = 0
+                sanity_damage = 0
+                
+                if zero_days == 1:
+                    # 경고만
+                    pass
+                elif zero_days == 2:
+                    hp_damage = 10
+                elif zero_days >= 3:
+                    hp_damage = 20
+                    sanity_damage = 10
+                
+                # 피해 적용
+                if hp_damage > 0:
+                    self.db.execute_query(
+                        "UPDATE user_state SET current_hp = MAX(0, current_hp - ?) WHERE user_id = ?",
+                        (hp_damage, user_id)
+                    )
+                
+                if sanity_damage > 0:
+                    self.db.execute_query(
+                        "UPDATE user_state SET current_sanity = MAX(0, current_sanity - ?) WHERE user_id = ?",
+                        (sanity_damage, user_id)
+                    )
+                
+                # 일수 업데이트
+                self.db.execute_query(
+                    "UPDATE user_state SET hunger_zero_days = ? WHERE user_id = ?",
+                    (zero_days, user_id)
+                )
+                
+                # 알림
+                user = self.bot.get_user(user_id)
+                if user:
+                    msg = f"⚠️ **굶주림 {zero_days}일차**\n"
+                    if hp_damage > 0:
+                        msg += f"체력 -{hp_damage}\n"
+                    if sanity_damage > 0:
+                        msg += f"정신력 -{sanity_damage}\n"
+                    msg += "빨리 식사를 하세요!"
+                    
+                    await user.send(msg)
+                
+                # 체력 0 체크
+                await self.check_hp_zero(user_id)
+        except Exception as e:
+            logger.error(f"Error in check_hunger_penalties: {e}")
 
     def cog_unload(self):
         self.daily_hunger_decay.cancel()
         self.daily_sanity_recovery.cancel()
+        self.daily_madness_recovery_check.cancel()
+        self.check_hunger_penalties.cancel()
 
     async def get_user_state(self, user_id):
         """DB에서 유저 상태를 가져옵니다. 없으면 생성합니다."""
@@ -136,23 +314,6 @@ class Survival(commands.Cog):
         new_hunger = min(MAX_HUNGER, state['hunger'] + recovery)
         
         # 4. DB 업데이트 (허기 증가, 아이템 감소)
-        self.db.execute_query(
-            "UPDATE user_state SET current_hunger = ? WHERE user_id = ?",
-            (new_hunger, interaction.user.id)
-        )
-        
-        if inventory_item[0] == 1:
-            self.db.execute_query("DELETE FROM user_inventory WHERE user_id = ? AND item_name = ?", (interaction.user.id, item_name))
-        else:
-            self.db.execute_query("UPDATE user_inventory SET count = count - 1 WHERE user_id = ? AND item_name = ?", (interaction.user.id, item_name))
-            
-        await interaction.response.send_message(f"🍞 {item_name}을(를) 먹었습니다. (허기 {int(state['hunger'])} -> {new_hunger})")
-
-    # --- Sanity System ---
-
-    @tasks.loop(hours=24)
-    async def daily_sanity_recovery(self):
-        """매일 아침 정신력 회복"""
         # 시간 체크 (06:00) 로직 필요하지만 일단 24시간 주기로 실행
         logger.info("Running daily sanity recovery task.")
         users = self.db.fetch_all("SELECT user_id, current_sanity, current_hunger FROM user_state")
