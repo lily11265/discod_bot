@@ -27,7 +27,9 @@ class Investigation(commands.Cog):
         self.bot = bot
         self.sheets = SheetsManager()
         self.sessions = {} # session_id (usually channel_id) -> InvestigationSession
+        self.sessions = {} # session_id (usually channel_id) -> InvestigationSession
         self.scheduled_tasks = []
+        self.active_investigations = {} # user_id: interaction_data
 
     async def category_autocomplete(self, interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
         """
@@ -195,6 +197,177 @@ class Investigation(commands.Cog):
         # 버튼 생성 (조건 체크 포함)
         view = InvestigationInteractionView(self, session, node)
         await channel.send(embed=embed, view=view)
+
+    @commands.Cog.listener()
+    async def on_dice_roll(self, interaction: discord.Interaction, dice_result: int):
+        """
+        stats.py의 /dice 명령어 실행 시 발생하는 이벤트
+        """
+        user_id = interaction.user.id
+        
+        # 1. 활성 조사 세션 확인
+        if user_id not in self.active_investigations:
+            return
+
+        active_data = self.active_investigations[user_id]
+        if active_data["state"] != "waiting_for_dice":
+            return
+            
+        # 2. 데이터 로드
+        item_data = active_data["item_data"]
+        variant = active_data["variant"]
+        channel_id = active_data["channel_id"]
+        
+        # 채널 확인 (다른 채널에서 굴린 주사위 무시)
+        if interaction.channel_id != channel_id:
+            return
+            
+        # 3. 목표값 계산 및 판정
+        stats = self.sheets.get_user_stats(discord_id=str(user_id))
+        if not stats:
+            await interaction.followup.send("❌ 스탯 정보를 불러올 수 없어 판정을 진행할 수 없습니다.", ephemeral=True)
+            return
+
+        # 판정 스탯 결정 (기본값: 관찰력)
+        # 조건 문자열에서 판정 스탯을 파싱하거나, 아이템 타입에 따라 결정
+        # 현재 구조에는 명시적인 판정 스탯 필드가 없음. 
+        # 임시: 'investigation' 타입은 'perception'(관찰력) 사용
+        target_stat = "perception"
+        stat_value = stats.get(target_stat, 50)
+        
+        # 난이도 보정 (Condition 등에서 파싱 가능하지만 일단 기본값 0)
+        difficulty_mod = 0 
+        target_value = stat_value + difficulty_mod
+        
+        # 판정 결과
+        result_type = GameLogic.check_result(dice_result, target_value)
+        
+        # 4. 결과에 따른 효과 및 묘사 선택
+        result_desc = ""
+        effect_string = ""
+        
+        if result_type == "CRITICAL_SUCCESS":
+            result_desc = variant.get("result_crit_success") or variant.get("result_success")
+            effect_string = variant.get("result_crit_success_effect", "") # 시트 컬럼 M? (구조 확인 필요)
+            pass
+        elif result_type == "SUCCESS":
+            result_desc = variant.get("result_success")
+        elif result_type == "FAILURE":
+            result_desc = variant.get("result_fail")
+        elif result_type == "CRITICAL_FAILURE":
+            result_desc = variant.get("result_crit_fail") or variant.get("result_fail")
+            
+        # 5. 효과 적용 및 묘사 분리
+        # 정규식으로 [effect] 추출
+        import re
+        effects = []
+        clean_desc = result_desc
+        
+        if result_desc:
+            # 1. [효과] 형식 찾기
+            matches = re.findall(r'\[(.*?)\]', result_desc)
+            if matches:
+                for match in matches:
+                    # 키워드 확인
+                    if any(k in match for k in ['clue+', 'item+', 'trigger+', '체력', '정신력']):
+                        effects.append(match)
+                        clean_desc = clean_desc.replace(f"[{match}]", "")
+            else:
+                # 2. 전체가 효과인지 확인 (한글 묘사 없이 영문/기호만 있는 경우)
+                if any(k in result_desc for k in ['clue+', 'item+', 'trigger+', '체력', '정신력']):
+                    pass
+
+        # 효과 적용
+        applied_effects = []
+        for effect in effects:
+            applied = await self.apply_effects(user_id, effect)
+            applied_effects.extend(applied)
+            
+        # 6. 결과 임베드 전송
+        embed = discord.Embed(
+            title=f"🎲 조사 결과: {result_type.replace('_', ' ')}",
+            description=f"**주사위**: {dice_result} / **목표**: {target_value} (스탯 {stat_value})\n\n{clean_desc}",
+            color=0x2ecc71 if "SUCCESS" in result_type else 0xe74c3c
+        )
+        
+        if applied_effects:
+            embed.add_field(name="효과 적용", value="\n".join(applied_effects), inline=False)
+            
+        await interaction.followup.send(embed=embed)
+        
+        # 7. 상태 초기화
+        del self.active_investigations[user_id]
+        
+        # 8. 오염 감지 (자동)
+        # TODO: Perception check & Pollution warning
+
+    async def apply_effects(self, user_id, effect_string):
+        """
+        효과 문자열 파싱 및 적용
+        예: "clue+desk1,item+key,체력-10"
+        """
+        results = []
+        tokens = effect_string.split(',')
+        
+        # DB Manager
+        db = self.bot.get_cog("Survival").db # Survival Cog의 DB 사용
+        
+        for token in tokens:
+            token = token.strip()
+            if not token: continue
+            
+            try:
+                if token.startswith("clue+"):
+                    clue_id = token.split('+')[1]
+                    # TODO: Clue 데이터 조회 (이름 등)
+                    db.execute_query("INSERT OR IGNORE INTO user_clues (user_id, clue_id) VALUES (?, ?)", (user_id, clue_id))
+                    results.append(f"💡 단서 획득: {clue_id}")
+                    
+                elif token.startswith("item+"):
+                    item_name = token.split('+')[1]
+                    # 인벤토리 추가
+                    existing = db.fetch_one("SELECT count FROM user_inventory WHERE user_id = ? AND item_name = ?", (user_id, item_name))
+                    if existing:
+                        db.execute_query("UPDATE user_inventory SET count = count + 1 WHERE user_id = ? AND item_name = ?", (user_id, item_name))
+                    else:
+                        db.execute_query("INSERT INTO user_inventory (user_id, item_name, count) VALUES (?, ?, 1)", (user_id, item_name))
+                    results.append(f"📦 아이템 획득: {item_name}")
+                    
+                elif token.startswith("체력"):
+                    # 체력+10, 체력-10
+                    op = '+' if '+' in token else '-'
+                    val = int(token.split(op)[1])
+                    change = val if op == '+' else -val
+                    
+                    db.execute_query("UPDATE user_state SET current_hp = MAX(0, current_hp + ?) WHERE user_id = ?", (change, user_id))
+                    results.append(f"❤️ 체력 {'회복' if change > 0 else '피해'}: {change}")
+                    
+                elif token.startswith("정신력"):
+                    op = '+' if '+' in token else '-'
+                    val = int(token.split(op)[1])
+                    change = val if op == '+' else -val
+                    
+                    db.execute_query("UPDATE user_state SET current_sanity = MAX(0, current_sanity + ?) WHERE user_id = ?", (change, user_id))
+                    results.append(f"🧠 정신력 {'회복' if change > 0 else '피해'}: {change}")
+                    
+                    # 정신력 0 체크는 Survival Cog에서 수행 (여기서 호출하거나, DB 트리거/주기적 체크)
+                    if change < 0:
+                        # Survival Cog의 trigger_madness_check 호출
+                        survival_cog = self.bot.get_cog("Survival")
+                        if survival_cog:
+                            # 비동기로 호출
+                            self.bot.loop.create_task(survival_cog.trigger_madness_check(user_id))
+
+                elif token.startswith("trigger+"):
+                    trigger_id = token.split('+')[1]
+                    db.execute_query("INSERT OR REPLACE INTO world_triggers (trigger_id, active, activated_by) VALUES (?, 1, ?)", (trigger_id, user_id))
+                    results.append(f"⚡ 트리거 활성화: {trigger_id}")
+                    
+            except Exception as e:
+                logger.error(f"Error applying effect {token}: {e}")
+                results.append(f"⚠️ 효과 적용 실패: {token}")
+                
+        return results
 
 class GatheringView(discord.ui.View):
     def __init__(self, expected_members, timeout=300):
@@ -376,6 +549,10 @@ class InvestigationInteractionView(discord.ui.View):
                 )
                 
         return callback
+
+
+
+
 
 async def setup(bot):
     await bot.add_cog(Investigation(bot))

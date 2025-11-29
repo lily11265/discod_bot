@@ -33,12 +33,20 @@ class Stats(commands.Cog):
         current_intelligence = GameLogic.calculate_current_stat(stats['intelligence'], sanity_percent)
         current_willpower = GameLogic.calculate_current_stat(stats['willpower'], sanity_percent)
 
+        # DB에서 허기 및 광기 로드
+        db = self.bot.get_cog("Survival").db
+        user_state = db.fetch_one("SELECT current_hunger FROM user_state WHERE user_id = ?", (interaction.user.id,))
+        current_hunger = user_state[0] if user_state else 0 # 기본값 0? or 100?
+        
+        madness_list = db.fetch_all("SELECT madness_name FROM user_madness WHERE user_id = ?", (interaction.user.id,))
+        madness_names = ", ".join([m[0] for m in madness_list]) if madness_list else "없음"
+
         # 임베드 생성
         embed = discord.Embed(title=f"📊 {stats['name']}님의 상태", color=0x3498db)
         
         embed.add_field(name="체력 (HP)", value=f"{stats['hp']}", inline=True)
-        embed.add_field(name=" 정신력 (Sanity)", value=f"{stats['sanity']}%", inline=True)
-        embed.add_field(name="\u200b", value="\u200b", inline=True) # 줄바꿈용 공백
+        embed.add_field(name="정신력 (Sanity)", value=f"{stats['sanity']}%", inline=True)
+        embed.add_field(name="허기 (Hunger)", value=f"{current_hunger}/50", inline=True)
 
         embed.add_field(
             name="감각 (Perception)", 
@@ -56,12 +64,19 @@ class Stats(commands.Cog):
             inline=True
         )
         
+        embed.add_field(name="보유 광기", value=madness_names, inline=False)
+        
         # 상태 메시지 추가
         status_msg = []
         if stats['sanity'] <= 0:
-            status_msg.append("**광기 상태**: 정신력이 바닥났습니다. 환각이 보일 수 있습니다.")
+            status_msg.append("⚠️ **광기 상태**: 정신력이 바닥났습니다. 환각이 보일 수 있습니다.")
         elif stats['sanity'] < 50:
-            status_msg.append("**불안**: 정신적으로 불안정합니다. 스탯이 크게 감소했습니다.")
+            status_msg.append("⚠️ **불안**: 정신적으로 불안정합니다. 스탯이 크게 감소했습니다.")
+        
+        if current_hunger <= 0:
+            status_msg.append("⚠️ **굶주림**: 배가 너무 고파 쓰러지기 직전입니다.")
+        elif current_hunger <= 10:
+            status_msg.append("⚠️ **배고픔**: 배가 많이 고픕니다.")
         
         if status_msg:
             embed.add_field(name="상태 이상", value="\n".join(status_msg), inline=False)

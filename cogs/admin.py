@@ -20,11 +20,22 @@ class Admin(commands.Cog):
     def cog_unload(self):
         self.sync_task.cancel()
 
-    @tasks.loop(hours=12)
+    @tasks.loop(time=datetime.time(hour=3, minute=0))
     async def sync_task(self):
-        """12시간마다 데이터를 동기화하고 캐시합니다."""
-        logger.info("Starting scheduled data sync...")
+        """매일 03:00에 데이터를 동기화하고 백업합니다."""
+        logger.info("Starting scheduled data sync (03:00 AM)...")
         await self.perform_sync()
+        
+        # 추가 백업 (DB -> Sheet)
+        # 관리자가 수동으로 시트를 수정했을 수 있으므로, 
+        # perform_sync()에서 시트->DB 동기화를 먼저 수행하고(옵션),
+        # 여기서는 DB의 최신 상태를 시트에 백업합니다.
+        # 하지만 perform_sync()는 현재 시트->메모리(캐시) 방향임.
+        # 유저 요청: "매일 03:00 동기화 태스크: a. 시트 E열 읽기 → DB 업데이트, b. DB 읽기 → 시트 E열 쓰기"
+        
+        # perform_sync() 내에서 처리하도록 위임하거나 여기서 호출
+        # perform_sync()는 "전체 동기화" 개념이므로 거기서 호출하는 것이 깔끔함.
+        pass
 
     @sync_task.before_loop
     async def before_sync_task(self):
@@ -33,6 +44,9 @@ class Admin(commands.Cog):
     async def perform_sync(self):
         """실제 동기화 로직 수행"""
         try:
+            # 0. DB Manager 가져오기
+            db_manager = self.bot.get_cog("Survival").db
+            
             # 1. 메타데이터 (ID <-> 이름)
             self.sheets.get_metadata_map()
             
@@ -43,8 +57,19 @@ class Admin(commands.Cog):
             data = self.sheets.fetch_investigation_data()
             if data:
                 self.bot.investigation_data = data
+                
+            # 4. 아이템 & 광기 데이터 캐싱 (Phase 2)
+            self.sheets.get_item_data("") # 전체 로드 트리거
+            self.sheets.get_madness_data("") # 전체 로드 트리거
             
-            # 4. 캐시 저장
+            # 5. 허기 동기화 (Phase 2)
+            # a. 시트 -> DB (관리자 수동 수정 반영)
+            self.sheets.sync_hunger_from_sheet(db_manager)
+            
+            # b. DB -> 시트 (백업)
+            self.sheets.sync_hunger_to_sheet(db_manager)
+            
+            # 6. 캐시 저장
             self.sheets.save_cache()
             
             logger.info(f"Data sync completed at {datetime.datetime.now()}")

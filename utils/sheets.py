@@ -426,3 +426,182 @@ class SheetsManager:
         except Exception as e:
             logger.error(f"Error fetching combination data: {e}")
             return None
+
+    # --- Phase 2: Core Systems Extensions ---
+
+    def sync_hunger_from_sheet(self, db_manager):
+        """
+        구글 시트 A의 "인벤토리" 워크시트 E열(허기) -> DB user_state.current_hunger
+        """
+        if not self.client:
+            return
+
+        try:
+            sheet = self.client.open_by_key(config.SPREADSHEET_ID_A).worksheet("인벤토리")
+            rows = sheet.get_all_values()
+            
+            # 메타데이터 로드 (이름 -> Discord ID)
+            metadata = self.get_metadata_map()
+            name_to_id = {v: k for k, v in metadata.items()}
+            
+            count = 0
+            for row in rows[1:]: # 헤더 스킵
+                if len(row) > 4:
+                    name = row[0].strip()
+                    hunger_str = row[4].strip() # E열 (0-indexed: 4)
+                    
+                    if name in name_to_id and hunger_str.isdigit():
+                        user_id = name_to_id[name]
+                        hunger = int(hunger_str)
+                        
+                        # DB 업데이트
+                        db_manager.execute_query(
+                            "UPDATE user_state SET current_hunger = ? WHERE user_id = ?",
+                            (hunger, user_id)
+                        )
+                        count += 1
+            
+            logger.info(f"Synced hunger from sheet for {count} users.")
+        except Exception as e:
+            logger.error(f"Error syncing hunger from sheet: {e}")
+
+    def sync_hunger_to_sheet(self, db_manager):
+        """
+        DB user_state.current_hunger -> 구글 시트 A의 "인벤토리" 워크시트 E열
+        """
+        if not self.client:
+            return
+
+        try:
+            sheet = self.client.open_by_key(config.SPREADSHEET_ID_A).worksheet("인벤토리")
+            rows = sheet.get_all_values()
+            
+            # DB에서 모든 유저 허기 조회
+            db_users = db_manager.fetch_all("SELECT user_id, current_hunger FROM user_state")
+            user_hunger_map = {str(uid): hunger for uid, hunger in db_users}
+            
+            # 메타데이터 로드 (Discord ID -> 이름)
+            metadata = self.get_metadata_map()
+            
+            updates = []
+            for i, row in enumerate(rows):
+                if i == 0: continue # 헤더
+                
+                name = row[0].strip()
+                # 이름으로 Discord ID 찾기 (역검색 필요하지만 metadata는 ID->Name)
+                # metadata 값 중 name과 일치하는 키 찾기
+                target_id = None
+                for uid, uname in metadata.items():
+                    if uname == name:
+                        target_id = uid
+                        break
+                
+                if target_id and target_id in user_hunger_map:
+                    # E열 (5번째 열) 업데이트
+                    # gspread는 1-based index: Row=i+1, Col=5
+                    updates.append({
+                        'range': f'E{i+1}',
+                        'values': [[user_hunger_map[target_id]]]
+                    })
+            
+            if updates:
+                sheet.batch_update(updates)
+                logger.info(f"Synced hunger to sheet for {len(updates)} users.")
+                
+        except Exception as e:
+            logger.error(f"Error syncing hunger to sheet: {e}")
+
+    def get_item_data(self, item_name: str):
+        """
+        SPREADSHEET_ID_B > "아이템데이터" 시트에서 아이템 정보 조회
+        """
+        # 캐시 확인
+        if 'items' in self.cached_data:
+            for item in self.cached_data['items']:
+                if item['name'] == item_name:
+                    return item
+        
+        # 캐시에 없으면 시트 조회 (또는 전체 로드 후 캐싱)
+        if not self.client:
+            return None
+
+        try:
+            sheet = self.client.open_by_key(config.SPREADSHEET_ID_B).worksheet("아이템데이터")
+            rows = sheet.get_all_values()
+            
+            items_list = []
+            target_item = None
+            
+            for row in rows[1:]:
+                if len(row) < 2: continue
+                # 가정: A=ID, B=Name, C=Type, D=Desc, E=Hunger, F=HP, G=Sanity
+                item = {
+                    'item_id': row[0].strip(),
+                    'name': row[1].strip(),
+                    'type': row[2].strip() if len(row) > 2 else "",
+                    'description': row[3].strip() if len(row) > 3 else "",
+                    'hunger_recovery': int(row[4]) if len(row) > 4 and row[4].isdigit() else 0,
+                    'hp_recovery': int(row[5]) if len(row) > 5 and row[5].isdigit() else 0,
+                    'sanity_recovery': int(row[6]) if len(row) > 6 and row[6].isdigit() else 0
+                }
+                items_list.append(item)
+                if item['name'] == item_name:
+                    target_item = item
+            
+            # 전체 캐싱
+            self.cached_data['items'] = items_list
+            return target_item
+            
+        except Exception as e:
+            logger.error(f"Error fetching item data: {e}")
+            return None
+
+    def get_madness_data(self, madness_id: str = None):
+        """
+        SPREADSHEET_ID_A > "광기데이터" 시트에서 광기 정보 조회
+        """
+        # 캐시 확인
+        if 'madness_list' in self.cached_data:
+            madness_list = self.cached_data['madness_list']
+            if madness_id:
+                for m in madness_list:
+                    if m['madness_id'] == madness_id:
+                        return m
+                return None
+            return madness_list
+
+        if not self.client:
+            return None
+
+        try:
+            sheet = self.client.open_by_key(config.SPREADSHEET_ID_A).worksheet("광기데이터")
+            rows = sheet.get_all_values()
+            
+            madness_list = []
+            
+            for row in rows[1:]:
+                if len(row) < 2: continue
+                # A=ID, B=Name, C=Desc, D=Type, E=Value, F=Diff, G=Condition
+                m_data = {
+                    'madness_id': row[0].strip(),
+                    'name': row[1].strip(),
+                    'description': row[2].strip() if len(row) > 2 else "",
+                    'effect_type': row[3].strip() if len(row) > 3 else "",
+                    'effect_value': row[4].strip() if len(row) > 4 else "",
+                    'recovery_difficulty': int(row[5]) if len(row) > 5 and row[5].isdigit() else 0,
+                    'acquisition_condition': row[6].strip() if len(row) > 6 else ""
+                }
+                madness_list.append(m_data)
+            
+            self.cached_data['madness_list'] = madness_list
+            
+            if madness_id:
+                for m in madness_list:
+                    if m['madness_id'] == madness_id:
+                        return m
+                return None
+            return madness_list
+            
+        except Exception as e:
+            logger.error(f"Error fetching madness data: {e}")
+            return None

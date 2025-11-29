@@ -107,25 +107,33 @@ class Survival(commands.Cog):
             await interaction.response.send_message("❌ 해당 아이템을 가지고 있지 않습니다.", ephemeral=True)
             return
 
-        # 2. 아이템 데이터 확인 (음식 여부, 회복량)
-        # TODO: SheetsManager에 get_item_data 구현 필요 (아이템데이터 시트 조회)
-        # 임시 로직: 이름에 '빵'이나 '통조림'이 들어가면 음식으로 간주
-        recovery = 0
-        if "빵" in item_name or "건빵" in item_name:
-            recovery = 15
-        elif "통조림" in item_name:
-            recovery = 30
+        # 2. 아이템 데이터 확인 (시트 연동)
+        item_data = self.sheets.get_item_data(item_name)
+        
+        if not item_data:
+            # 시트에 없으면 기존 하드코딩 로직 (Fallback)
+            recovery = 0
+            if "빵" in item_name or "건빵" in item_name: recovery = 15
+            elif "통조림" in item_name: recovery = 30
+            else:
+                await interaction.response.send_message("❌ 알 수 없는 아이템입니다.", ephemeral=True)
+                return
         else:
-            await interaction.response.send_message("❌ 음식이 아닌 것 같습니다.", ephemeral=True)
-            return
+            if item_data['type'] != '음식':
+                await interaction.response.send_message("❌ 음식이 아닙니다.", ephemeral=True)
+                return
+            recovery = item_data['hunger_recovery']
 
         # 3. 허기 회복
         state = await self.get_user_state(interaction.user.id)
-        if state['hunger'] >= 100:
+        # 최대 허기 50 (유저 요청 5.1)
+        MAX_HUNGER = 50 
+        
+        if state['hunger'] >= MAX_HUNGER:
             await interaction.response.send_message("❌ 배가 부릅니다.", ephemeral=True)
             return
             
-        new_hunger = min(100, state['hunger'] + recovery)
+        new_hunger = min(MAX_HUNGER, state['hunger'] + recovery)
         
         # 4. DB 업데이트 (허기 증가, 아이템 감소)
         self.db.execute_query(
@@ -169,7 +177,24 @@ class Survival(commands.Cog):
                         "UPDATE user_state SET current_sanity = ?, last_sanity_recovery = CURRENT_TIMESTAMP WHERE user_id = ?",
                         (new_sanity, user_id)
                     )
-                    # 알림 전송 (선택사항)
+                else:
+                    # 회복 실패 알림 (DM)
+                    user = self.bot.get_user(user_id)
+                    if not user:
+                        try:
+                            user = await self.bot.fetch_user(user_id)
+                        except:
+                            pass
+                    
+                    if user:
+                        try:
+                            await user.send(
+                                f"⚠️ 배고픔 때문에 정신이 회복되지 않습니다.\n"
+                                f"필요 허기: {int(threshold)} (현재: {int(hunger)})"
+                            )
+                        except discord.Forbidden:
+                            pass # DM 차단 등
+
             except Exception as e:
                 logger.error(f"Error processing sanity recovery for {user_id}: {e}")
 
@@ -224,6 +249,86 @@ class Survival(commands.Cog):
             embed.add_field(name="회복 필요 허기", value=f"{int(threshold)} 이상", inline=True)
             
         await interaction.response.send_message(embed=embed)
+
+    # --- Madness System ---
+
+    async def trigger_madness_check(self, user_id):
+        """
+        정신력이 0에 도달했을 때 자동 호출되는 광기 판정
+        """
+        stats = self.sheets.get_user_stats(discord_id=str(user_id))
+        if not stats: return
+
+        intelligence = stats['intelligence']
+        
+        # 광기 저항 판정 (GameLogic 사용 권장하지만 여기서는 직접 구현)
+        # 목표값 = 10 - (지성 - 40) * 0.6
+        # (지성이 높을수록 목표값이 낮아짐 -> 성공 확률 낮아짐? 보통 지성이 높으면 광기에 취약하다는 설정?)
+        # 유저 공식: 10 - (지성 - 40) * 0.6
+        # 예: 지성 50 -> 10 - (10 * 0.6) = 4. 목표값 4 이하가 나와야 성공? (매우 어려움)
+        # 예: 지성 30 -> 10 - (-10 * 0.6) = 16. 목표값 16 이하.
+        # 즉, 지성이 높을수록 저항하기 어려움 (크툴루 신화 스타일)
+        
+        target_value = 10 - (intelligence - 40) * 0.6
+        import random
+        dice_roll = random.randint(1, 100)
+        
+        user = self.bot.get_user(user_id)
+        if not user:
+            try: user = await self.bot.fetch_user(user_id)
+            except: pass
+            
+        if dice_roll <= target_value:
+            # 저항 성공
+            self.db.execute_query("UPDATE user_state SET current_sanity = 1 WHERE user_id = ?", (user_id,))
+            if user:
+                await user.send(f"🧠 **광기 저항 성공!** (주사위: {dice_roll} / 목표: {int(target_value)})\n논리로 광기를 버텨냈습니다. 정신력이 1이 됩니다.")
+        else:
+            # 저항 실패 -> 광기 획득
+            await self.acquire_random_madness(user_id)
+            if user:
+                await user.send(f"😱 **광기 저항 실패...** (주사위: {dice_roll} / 목표: {int(target_value)})\n광기에 잠식됩니다.")
+
+    async def acquire_random_madness(self, user_id, context='default'):
+        """랜덤 광기 획득"""
+        import random
+        
+        all_madness = self.sheets.get_madness_data()
+        if not all_madness:
+            logger.error("No madness data found.")
+            return
+
+        # 이미 보유한 광기 제외
+        owned_madness = self.db.fetch_all("SELECT madness_id FROM user_madness WHERE user_id = ?", (user_id,))
+        owned_ids = [m[0] for m in owned_madness]
+        
+        available_madness = [m for m in all_madness if m['madness_id'] not in owned_ids]
+        
+        if not available_madness:
+            # 모든 광기 보유 중
+            return
+            
+        # 랜덤 선택
+        selected = random.choice(available_madness)
+        
+        # DB 저장
+        self.db.execute_query(
+            "INSERT INTO user_madness (user_id, madness_id, madness_name) VALUES (?, ?, ?)",
+            (user_id, selected['madness_id'], selected['name'])
+        )
+        
+        # 알림
+        user = self.bot.get_user(user_id)
+        if not user:
+            try: user = await self.bot.fetch_user(user_id)
+            except: pass
+            
+        if user:
+            await user.send(
+                f"🎭 **새로운 광기 획득: {selected['name']}**\n"
+                f"{selected['description']}\n"
+                f"효과: {selected['effect_type']} {selected['effect_value']}"
+            )
 
 async def setup(bot):
     await bot.add_cog(Survival(bot))
