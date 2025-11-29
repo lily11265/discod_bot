@@ -348,6 +348,71 @@ class SheetsManager:
             logger.error(f"Error fetching investigation data: {e}")
             return {}
 
+    def initialize_worksheets(self):
+        """
+        필요한 워크시트가 있는지 확인하고, 없으면 생성하고 헤더와 예시 데이터를 추가합니다.
+        """
+        if not self.client:
+            return
+
+        # 1. 스프레드시트 A (설정 데이터)
+        try:
+            sheet_a = self.client.open_by_key(config.SPREADSHEET_ID_A)
+            required_sheets_a = {
+                "광기데이터": ["광기 ID", "광기명", "설명", "효과 타입", "효과 값", "회복 난이도", "획득 조건"],
+                "생각데이터": ["생각 ID", "생각명", "설명", "필요 단서", "기본 진행도", "완성 조건", "효과 타입", "효과 내용", "제약 내용", "슬롯 비용"],
+                "단서데이터": ["단서 ID", "단서명", "카테고리", "설명", "연관 단서", "조합 가능 여부", "비고"]
+            }
+            
+            # 예시 데이터
+            example_data_a = {
+                "광기데이터": ["madness_paranoia", "피해망상", "타인을 의심하게 됨", "페널티", "신뢰_판정:-15", "+5", "정신력_0_괴물조우"],
+                "생각데이터": ["thought_sharp_eye", "날카로운 관찰력", "세밀한 것을 본다", '["clue_magnifier"]', "10", "100%", "보너스", "조사_성공률:+10", "-", "1"],
+                "단서데이터": ["clue_desk1_basic", "책상의 서류", "물적증거", "찢어진 문서 조각", '["clue_desk2"]', "Y", "-"]
+            }
+
+            existing_titles_a = [ws.title for ws in sheet_a.worksheets()]
+            
+            for title, headers in required_sheets_a.items():
+                if title not in existing_titles_a:
+                    logger.info(f"Creating missing worksheet in A: {title}")
+                    ws = sheet_a.add_worksheet(title=title, rows=100, cols=20)
+                    ws.append_row(headers)
+                    if title in example_data_a:
+                        ws.append_row(example_data_a[title])
+        except Exception as e:
+            logger.error(f"Error initializing Spreadsheet A: {e}")
+
+        # 2. 스프레드시트 D (유저 동적 데이터)
+        if not config.SPREADSHEET_ID_D:
+            logger.warning("SPREADSHEET_ID_D is not set. Skipping initialization.")
+            return
+
+        try:
+            sheet_d = self.client.open_by_key(config.SPREADSHEET_ID_D)
+            required_sheets_d = {
+                "유저_상태": ["Discord ID", "캐릭터명", "현재 체력", "현재 정신력", "현재 허기", "감염도", "마지막 허기 업데이트", "마지막 정신력 회복", "허기 0 지속 일수", "최종 업데이트"],
+                "유저_인벤토리": ["Discord ID", "캐릭터명", "아이템 ID", "아이템명", "수량", "획득 시각"],
+                "유저_단서": ["Discord ID", "캐릭터명", "단서 ID", "단서명", "획득 시각"],
+                "유저_광기": ["Discord ID", "캐릭터명", "광기 ID", "광기명", "획득 시각", "마지막 회복 시도"],
+                "유저_사고": ["Discord ID", "캐릭터명", "생각 ID", "생각명", "상태", "진행도", "시작 시각", "완성 시각"],
+                "월드_트리거": ["트리거 ID", "트리거명", "활성 여부", "활성화한 유저 ID", "활성화 시각"],
+                "월드_상태": ["키", "값", "설명", "최종 업데이트"],
+                "조사_카운트": ["Discord ID", "캐릭터명", "아이템 고유 ID", "조사 횟수", "마지막 조사 시각", "리셋 타입"],
+                "제거된_아이템": ["지역 ID", "아이템 ID", "제거한 유저 ID", "제거 시각"],
+                "차단된_지역": ["지역 ID", "차단 사유", "차단 시각"]
+            }
+            
+            existing_titles_d = [ws.title for ws in sheet_d.worksheets()]
+            
+            for title, headers in required_sheets_d.items():
+                if title not in existing_titles_d:
+                    logger.info(f"Creating missing worksheet in D: {title}")
+                    ws = sheet_d.add_worksheet(title=title, rows=100, cols=20)
+                    ws.append_row(headers)
+        except Exception as e:
+            logger.error(f"Error initializing Spreadsheet D: {e}")
+
     def get_info_combinations(self):
         """
         구글 스프레드시트 B의 "정보 조합" 시트 데이터를 가져옵니다.
