@@ -179,6 +179,7 @@ class Stats(commands.Cog):
             
             # 같은 채널에서 굴린 주사위만 처리
             if active_data["channel_id"] == interaction.channel_id:
+                await interaction.response.defer()  # ✅ 여기서 defer
                 await inv_cog.process_investigation_dice(interaction, result)
                 return
         
