@@ -209,6 +209,20 @@ class SheetsManager:
             world_map = {}
             
             for sheet in worksheets:
+                # 카테고리(워크시트) 노드 생성
+                category_name = sheet.title
+                if category_name not in world_map:
+                    world_map[category_name] = {
+                        "id": category_name,
+                        "name": category_name,
+                        "description": f"{category_name} 지역입니다.",
+                        "children": {},
+                        "items": [],
+                        "type": "category"
+                    }
+                
+                category_root = world_map[category_name]
+                
                 rows = sheet.get_all_values()
                 
                 # Fill Down을 위한 상태 변수
@@ -236,36 +250,24 @@ class SheetsManager:
                                 last_seen[j] = ""
                         else:
                             # 값이 없으면 이전 값 사용 (Fill Down)
-                            # 단, 상위 레벨이 바뀌었으면(identity_changed) 초기화된 값을 사용하게 됨("")
                             pass
                         
                         current_identity.append(last_seen[i])
 
                     # G, H (6, 7) 처리 (Button, Type)
-                    # Identity(A~F)가 같다면 G, H도 Fill Down 가능
-                    # Identity가 다르면 G, H는 새로 읽어야 함 (위 루프에서 이미 초기화됨)
                     for i in range(6, 8):
                         val = row[i].strip() if len(row) > i else ""
                         if val:
                             last_seen[i] = val
-                        # 값이 없으면 last_seen 사용 (위에서 초기화되었거나 이전 값 유지)
 
                     # 현재 행의 데이터 구성
-                    # A~E: Location Path (0~4)
+                    # A~E: Location Path (0~4) - A열 포함!
                     # F: Item Name (5)
                     # G: Button Text (6)
                     # H: Type (7)
                     
                     # 유효한 경로 추출 (A~E 중 값이 있는 것)
-                    # A(채널)은 무시하고 B부터 시작? 
-                    # 유저: "A열: 해당 카테고리 내에 조사시트가 구현된 채널 이름"
-                    # B열: 최상위 지역
-                    # 따라서 실제 트리는 B부터 시작. A는 "어디서 시작하는지" 매핑용이지만,
-                    # 현재 구조는 Category(Sheet Name) -> B -> C... 구조임.
-                    # A열은 검증용이나 시작점 찾기용으로 쓸 수 있음.
-                    
-                    # B~E (1~4) : 지역 경로
-                    location_path = [x for x in last_seen[1:5] if x]
+                    location_path = [x for x in last_seen[0:5] if x]
                     item_name = last_seen[5] # F열
                     button_text = last_seen[6] # G열
                     interaction_type = last_seen[7] # H열
@@ -273,21 +275,26 @@ class SheetsManager:
                     if not location_path: continue
 
                     # 트리 구성
-                    current_level = world_map
-                    path_id = ""
+                    current_level = category_root["children"]
+                    path_id = category_name
                     
                     # 지역 노드 생성/이동
-                    for loc_name in location_path:
-                        path_id = f"{path_id}_{loc_name}" if path_id else loc_name
+                    for depth, loc_name in enumerate(location_path):
+                        path_id = f"{path_id}_{loc_name}"
                         if loc_name not in current_level:
+                            # A열(depth 0)은 채널로 취급
+                            is_channel = (depth == 0)
+                            
                             current_level[loc_name] = {
                                 "id": path_id,
                                 "name": loc_name,
                                 "description": "",
                                 "children": {},
-                                "items": [], # {name, button_text, variants: []}
-                                "type": "location"
+                                "items": [], 
+                                "type": "location",
+                                "is_channel": is_channel # 채널 여부 플래그
                             }
+                        
                         # 마지막 노드 저장
                         target_location = current_level[loc_name]
                         current_level = current_level[loc_name]["children"]
@@ -362,31 +369,14 @@ class SheetsManager:
             required_sheets_a = {
                 "캐릭터 스탯 정리표": [
                     "Discord ID", "캐릭터명", "종족", "직업", "체력", "정신력", "감각", "지성", "의지"
-                ],
-                "광기데이터": [
-                    "광기 ID", "광기명", "설명", "효과 타입", "효과 값", "회복 난이도", "획득 조건"
-                ],
-                "생각데이터": [
-                    "생각 ID", "생각명", "설명", "필요 단서", "기본 진행도", "완성 조건", "효과 타입", "효과 내용", "제약 내용", "슬롯 비용"
-                ],
-                "단서데이터": [
-                    "단서 ID", "단서명", "카테고리", "설명", "연관 단서", "조합 가능 여부", "비고"
                 ]
+
             }
             
             # 예시 데이터
             example_data_a = {
                 "캐릭터 스탯 정리표": [
                     "1234567890", "테스트캐릭터", "인간", "조사관", "100", "100", "50", "50", "50"
-                ],
-                "광기데이터": [
-                    "madness_paranoia", "피해망상", "타인을 의심하게 됨", "페널티", "신뢰_판정:-15", "50", "정신력_0_괴물조우"
-                ],
-                "생각데이터": [
-                    "thought_sharp_eye", "날카로운 관찰력", "세밀한 것을 본다", "clue_magnifier", "10", "100", "보너스", "조사_성공률:+10", "-", "1"
-                ],
-                "단서데이터": [
-                    "clue_desk1_basic", "책상의 서류", "물적증거", "찢어진 문서 조각", "clue_desk2", "Y", "-"
                 ]
             }
 
@@ -415,6 +405,15 @@ class SheetsManager:
                 ],
                 "정보 조합": [
                     "조합 ID", "필요 단서 1", "필요 단서 2", "필요 단서 3", "결과 단서"
+                ],
+                "광기데이터": [
+                    "광기 ID", "광기명", "설명", "효과 타입", "효과 값", "회복 난이도", "획득 조건"
+                ],
+                "생각데이터": [
+                    "생각 ID", "생각명", "설명", "필요 단서", "기본 진행도", "완성 조건", "효과 타입", "효과 내용", "제약 내용", "슬롯 비용"
+                ],
+                "단서데이터": [
+                    "단서 ID", "단서명", "카테고리", "설명", "연관 단서", "조합 가능 여부", "비고"
                 ]
             }
             
@@ -427,6 +426,15 @@ class SheetsManager:
                 ],
                 "정보 조합": [
                     "combo_01", "clue_desk1_basic", "clue_calendar", "", "clue_ritual_date"
+                ],
+                "광기데이터": [
+                    "madness_paranoia", "피해망상", "타인을 의심하게 됨", "페널티", "신뢰_판정:-15", "50", "정신력_0_괴물조우"
+                ],
+                "생각데이터": [
+                    "thought_sharp_eye", "날카로운 관찰력", "세밀한 것을 본다", "clue_magnifier", "10", "100", "보너스", "조사_성공률:+10", "-", "1"
+                ],
+                "단서데이터": [
+                    "clue_desk1_basic", "책상의 서류", "물적증거", "찢어진 문서 조각", "clue_desk2", "Y", "-"
                 ]
             }
 
@@ -639,7 +647,7 @@ class SheetsManager:
 
     def get_madness_data(self, madness_id: str = None):
         """
-        SPREADSHEET_ID_A > "광기데이터" 시트에서 광기 정보 조회
+        SPREADSHEET_ID_B > "광기데이터" 시트에서 광기 정보 조회
         """
         # 캐시 확인
         if 'madness_list' in self.cached_data:
@@ -655,7 +663,7 @@ class SheetsManager:
             return None
 
         try:
-            sheet = self.client.open_by_key(config.SPREADSHEET_ID_A).worksheet("광기데이터")
+            sheet = self.client.open_by_key(config.SPREADSHEET_ID_B).worksheet("광기데이터")
             rows = sheet.get_all_values()
             
             madness_list = []

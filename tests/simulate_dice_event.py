@@ -1,7 +1,11 @@
-import asyncio
 import logging
 import sys
 import os
+import asyncio
+
+# Configure logging
+logging.basicConfig(level=logging.DEBUG, stream=sys.stdout)
+
 # Add project root to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 

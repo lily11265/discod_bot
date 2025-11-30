@@ -196,14 +196,17 @@ class Investigation(commands.Cog):
         )
         
         # 버튼 생성 (조건 체크 포함)
+        logger.debug(f"Creating InvestigationInteractionView for node: {node['name']}")
         view = InvestigationInteractionView(self, session, node)
         message = await channel.send(embed=embed, view=view)
         view.message = message # 메시지 참조 저장
 
         # ✅ 위험 감지 자동 판정 (각 멤버별)
+        logger.debug(f"Checking danger detection for members: {session.members}")
         for member_id in session.members:
             stats = self.sheets.get_user_stats(discord_id=str(member_id))
             if not stats:
+                logger.debug(f"Skipping danger check for {member_id}: No stats found")
                 continue
             
             db = self.bot.get_cog("Survival").db
@@ -244,60 +247,65 @@ class Investigation(commands.Cog):
         stats.py의 /dice 명령어에서 호출되는 메서드
         """
         user_id = interaction.user.id
+        logger.debug(f"Processing investigation dice for user {user_id}. Result: {dice_result}")
         
-        # 1. 활성 조사 세션 확인
         if user_id not in self.active_investigations:
+            logger.debug(f"User {user_id} has no active investigation.")
             return
 
         active_data = self.active_investigations[user_id]
-        if active_data["state"] != "waiting_for_dice":
-            return
-            
-        # 2. 데이터 로드
-        item_data = active_data["item_data"]
-        variant = active_data["variant"]
-        channel_id = active_data["channel_id"]
         
-        # 채널 확인 (다른 채널에서 굴린 주사위 무시)
-        if interaction.channel_id != channel_id:
+        # 상태 확인
+        if active_data["state"] != "waiting_for_dice":
+            logger.debug(f"User {user_id} is not in 'waiting_for_dice' state. Current: {active_data['state']}")
             return
             
-        # 3. 목표값 계산 및 판정
-        stats = self.sheets.get_user_stats(discord_id=str(user_id))
-        if not stats:
-            await interaction.followup.send("❌ 스탯 정보를 불러올 수 없어 판정을 진행할 수 없습니다.", ephemeral=True)
+        # 채널 확인 (다른 채널의 주사위 무시)
+        if interaction.channel_id != active_data["channel_id"]:
+            logger.debug(f"Channel mismatch for user {user_id}. Expected {active_data['channel_id']}, got {interaction.channel_id}")
             return
 
-        # 판정 스탯 결정 (기본값: 관찰력)
-        # 조건 문자열에서 판정 스탯을 파싱하거나, 아이템 타입에 따라 결정
-        # 현재 구조에는 명시적인 판정 스탯 필드가 없음. 
-        # 임시: 'investigation' 타입은 'perception'(관찰력) 사용
-        target_stat = "perception"
-        stat_value = stats.get(target_stat, 50)
+        logger.info(f"Dice roll processed for {interaction.user.display_name}: {dice_result}")
         
-        # 난이도 보정 (Condition 등에서 파싱 가능하지만 일단 기본값 0)
-        difficulty_mod = 0 
-        target_value = stat_value + difficulty_mod
+        # 1. 상태 업데이트 (중복 처리 방지)
+        del self.active_investigations[user_id]
         
-        # 판정 결과
+        item_data = active_data["item_data"]
+        variant = active_data["variant"]
+        
+        # 2. 결과 판정
+        # 스탯 기반 판정 (예: perception)
+        stat_name = variant.get("stat", "perception") # 기본값 감각
+        target_value = 50 # 기본 목표값
+        
+        # 시트에서 유저 스탯 가져오기
+        user_stats = self.sheets.get_user_stats(discord_id=str(user_id))
+        if user_stats and stat_name in user_stats:
+            target_value = user_stats[stat_name]
+            logger.debug(f"Using stat '{stat_name}' for check. Base value: {target_value}")
+        else:
+            logger.debug(f"Stat '{stat_name}' not found. Using default target: {target_value}")
+            
+        # 난이도 보정
+        difficulty = variant.get("difficulty", 0)
+        target_value += difficulty
+        logger.debug(f"Target value after difficulty ({difficulty}): {target_value}")
+        
         result_type = GameLogic.check_result(dice_result, target_value)
-        
-        # 4. 결과에 따른 효과 및 묘사 선택
-        result_desc = ""
+        logger.debug(f"Check result: {result_type} (Dice: {dice_result} vs Target: {target_value})")
+
+        # 3. 결과 적용
+        result_text = ""
         effect_string = ""
         
-        if result_type == "CRITICAL_SUCCESS":
-            result_desc = variant.get("result_crit_success") or variant.get("result_success")
-            effect_string = variant.get("result_crit_success_effect", "") # 시트 컬럼 M? (구조 확인 필요)
-            pass
-        elif result_type == "SUCCESS":
-            result_desc = variant.get("result_success")
-        elif result_type == "FAILURE":
-            result_desc = variant.get("result_fail")
-        elif result_type == "CRITICAL_FAILURE":
-            result_desc = variant.get("result_crit_fail") or variant.get("result_fail")
-            
         if result_type in ["SUCCESS", "CRITICAL_SUCCESS"]:
+            result_text = variant.get("result_success", "성공!")
+            # [] 안의 효과 파싱 (예: "상자를 열었다. [item+key, sanity+10]")
+            if "[" in result_text and "]" in result_text:
+                parts = result_text.split("[")
+                result_text = parts[0].strip()
+                effect_string = parts[1].replace("]", "").strip()
+                
             # ✅ 오염 판별 자동 판정
             stats = self.sheets.get_user_stats(discord_id=str(user_id))
             db = self.bot.get_cog("Survival").db
@@ -322,112 +330,101 @@ class Investigation(commands.Cog):
                         f"🟢 **오염 감지!**\n"
                         f"이 {item_data['name']}은(는) 오염되어 있습니다!"
                     )
-            
-        # 5. 효과 적용 및 묘사 분리
-        # 정규식으로 [effect] 추출
-        import re
-        effects = []
-        clean_desc = result_desc
-        
-        if result_desc:
-            # 1. [효과] 형식 찾기
-            matches = re.findall(r'\[(.*?)\]', result_desc)
-            if matches:
-                for match in matches:
-                    # 키워드 확인
-                    if any(k in match for k in ['clue+', 'item+', 'trigger+', '체력', '정신력']):
-                        effects.append(match)
-                        clean_desc = clean_desc.replace(f"[{match}]", "")
-            else:
-                # 2. 전체가 효과인지 확인 (한글 묘사 없이 영문/기호만 있는 경우)
-                if any(k in result_desc for k in ['clue+', 'item+', 'trigger+', '체력', '정신력']):
-                    pass
+
+        else:
+            result_text = variant.get("result_fail", "실패...")
+            # 실패 시에도 효과가 있을 수 있음 (함정 등)
+            if "[" in result_text and "]" in result_text:
+                parts = result_text.split("[")
+                result_text = parts[0].strip()
+                effect_string = parts[1].replace("]", "").strip()
 
         # 효과 적용
-        applied_effects = []
-        for effect in effects:
-            applied = await self.apply_effects(user_id, effect)
-            applied_effects.extend(applied)
-            
-        # 6. 결과 임베드 전송
+        effect_results = await self.apply_effects(user_id, effect_string)
+        
+        # 4. 결과 출력
         embed = discord.Embed(
-            title=f"🎲 조사 결과: {result_type.replace('_', ' ')}",
-            description=f"**주사위**: {dice_result} / **목표**: {target_value} (스탯 {stat_value})\n\n{clean_desc}",
-            color=0x2ecc71 if "SUCCESS" in result_type else 0xe74c3c
+            title=f"🎲 조사 결과: {result_type}",
+            description=f"{result_text}",
+            color=0x2ecc71 if result_type in ["SUCCESS", "CRITICAL_SUCCESS"] else 0xe74c3c
         )
         
-        if applied_effects:
-            embed.add_field(name="효과 적용", value="\n".join(applied_effects), inline=False)
+        if effect_results:
+            embed.add_field(name="효과 적용", value="\n".join(effect_results), inline=False)
             
         await interaction.followup.send(embed=embed)
-        
-        # 7. 상태 초기화
-        del self.active_investigations[user_id]
-        
-        # 8. 오염 감지 (자동)
-        # TODO: Perception check & Pollution warning
 
     async def apply_effects(self, user_id, effect_string):
         """
-        효과 문자열 파싱 및 적용
-        예: "clue+desk1,item+key,체력-10"
+        효과 문자열을 파싱하여 적용합니다.
+        예: "clue+단서ID, item+아이템명, 체력-10, 정신력+5, trigger+트리거ID"
         """
+        logger.debug(f"Applying effects for user {user_id}: {effect_string}")
         results = []
-        tokens = effect_string.split(',')
+        if not effect_string:
+            return results
+            
+        # 콤마로 분리
+        tokens = [t.strip() for t in effect_string.split(',')]
         
-        # DB Manager
-        db = self.bot.get_cog("Survival").db # Survival Cog의 DB 사용
+        db = self.bot.get_cog("Survival").db
         
         for token in tokens:
-            token = token.strip()
-            if not token: continue
-            
             try:
+                logger.debug(f"Processing token: {token}")
                 if token.startswith("clue+"):
                     clue_id = token.split('+')[1]
-                    # TODO: Clue 데이터 조회 (이름 등)
-                    db.execute_query("INSERT OR IGNORE INTO user_clues (user_id, clue_id) VALUES (?, ?)", (user_id, clue_id))
-                    results.append(f"💡 단서 획득: {clue_id}")
+                    # 단서 이름 조회 (시트에서)
+                    clue_data = self.sheets.get_clue_data(clue_id) # TODO: Implement get_clue_data
+                    clue_name = clue_data['name'] if clue_data else clue_id
                     
+                    db.execute_query("INSERT OR IGNORE INTO user_clues (user_id, clue_id, clue_name) VALUES (?, ?, ?)", (user_id, clue_id, clue_name))
+                    results.append(f"🔍 단서 획득: {clue_name}")
+                    logger.debug(f"Clue acquired: {clue_id}")
+
                 elif token.startswith("item+"):
                     item_name = token.split('+')[1]
                     # 인벤토리 추가
-                    existing = db.fetch_one("SELECT count FROM user_inventory WHERE user_id = ? AND item_name = ?", (user_id, item_name))
-                    if existing:
-                        db.execute_query("UPDATE user_inventory SET count = count + 1 WHERE user_id = ? AND item_name = ?", (user_id, item_name))
-                    else:
-                        db.execute_query("INSERT INTO user_inventory (user_id, item_name, count) VALUES (?, ?, 1)", (user_id, item_name))
+                    db.execute_query("""
+                        INSERT INTO user_inventory (user_id, item_name, count) 
+                        VALUES (?, ?, 1) 
+                        ON CONFLICT(user_id, item_name) 
+                        DO UPDATE SET count = count + 1
+                    """, (user_id, item_name))
                     results.append(f"📦 아이템 획득: {item_name}")
-                    
-                elif token.startswith("체력"):
-                    # 체력+10, 체력-10
+                    logger.debug(f"Item acquired: {item_name}")
+
+                elif "체력" in token:
+                    # 예: "체력-10", "체력+20"
                     op = '+' if '+' in token else '-'
-                    val = int(token.split(op)[1])
-                    change = val if op == '+' else -val
+                    value = int(token.split(op)[1])
+                    change = value if op == '+' else -value
                     
-                    db.execute_query("UPDATE user_state SET current_hp = MAX(0, current_hp + ?) WHERE user_id = ?", (change, user_id))
-                    results.append(f"❤️ 체력 {'회복' if change > 0 else '피해'}: {change}")
+                    db.execute_query("UPDATE user_state SET current_hp = current_hp + ? WHERE user_id = ?", (change, user_id))
+                    results.append(f"❤️ 체력 {'회복' if change > 0 else '감소'}: {change}")
+                    logger.debug(f"HP changed by {change}")
                     
-                elif token.startswith("정신력"):
+                    # 체력 0 체크
+                    await self.bot.get_cog("Survival").check_hp_zero(user_id)
+
+                elif "정신력" in token:
                     op = '+' if '+' in token else '-'
-                    val = int(token.split(op)[1])
-                    change = val if op == '+' else -val
+                    value = int(token.split(op)[1])
+                    change = value if op == '+' else -value
                     
-                    db.execute_query("UPDATE user_state SET current_sanity = MAX(0, current_sanity + ?) WHERE user_id = ?", (change, user_id))
-                    results.append(f"🧠 정신력 {'회복' if change > 0 else '피해'}: {change}")
+                    db.execute_query("UPDATE user_state SET current_sanity = current_sanity + ? WHERE user_id = ?", (change, user_id))
+                    results.append(f"🧠 정신력 {'회복' if change > 0 else '감소'}: {change}")
+                    logger.debug(f"Sanity changed by {change}")
                     
-                    # 정신력 0 체크는 Survival Cog에서 수행 (여기서 호출하거나, DB 트리거/주기적 체크)
+                    # 광기 체크 (감소 시에만)
                     if change < 0:
-                        # Survival Cog의 trigger_madness_check 호출
-                        survival_cog = self.bot.get_cog("Survival")
-                        if survival_cog:
-                            # 비동기로 호출
-                            self.bot.loop.create_task(survival_cog.trigger_madness_check(user_id))
+                        await self.bot.get_cog("Survival").trigger_madness_check(user_id)
 
                 elif token.startswith("trigger+"):
                     trigger_id = token.split('+')[1]
                     db.execute_query("INSERT OR REPLACE INTO world_triggers (trigger_id, active, activated_by) VALUES (?, 1, ?)", (trigger_id, user_id))
                     results.append(f"⚡ 트리거 활성화: {trigger_id}")
+                    logger.debug(f"Trigger activated: {trigger_id}")
 
                 elif token.startswith("공포"):
                     # 예: "공포-20"
@@ -462,14 +459,7 @@ class Investigation(commands.Cog):
                                 f"공포를 이겨냈습니다!"
                             )
                     
-                    # 2. 공포 피해 계산 (저항 여부와 관계없이 감소 적용 - 기획 확인 필요하지만 일단 요청대로)
-                    # 요청: "저항 성공 시"에 대한 언급 없음. 보통 저항 성공하면 피해 반감 등이지만, 
-                    # 요청 로직: "저항 여부와 관계없이 감소 적용" -> "actual_damage = calculate_fear_damage..."
-                    # 아마 저항 성공 시 데미지 경감 로직이 calculate_fear_damage에 있거나, 
-                    # 여기서는 일단 "공포 저항 성공 메시지"만 띄우고 데미지는 그대로 들어가는 듯?
-                    # 혹은 저항 성공 시 데미지가 0이 되어야 하나?
-                    # 유저 코드 예시: "2. 공포 피해 계산 (저항 여부와 관계없이 감소 적용)" 이라고 주석 있음.
-                    
+                    # 2. 공포 피해 계산
                     actual_damage = GameLogic.calculate_fear_damage(base_damage, current_willpower)
                     
                     # 3. 감각에 따른 정신력 피해 증폭
@@ -489,6 +479,7 @@ class Investigation(commands.Cog):
                         f"😱 공포 피해: -{final_damage} 정신력 "
                         f"(기본 {base_damage} → 의지 감소 {actual_damage} → 감각 증폭 {final_damage})"
                     )
+                    logger.debug(f"Fear effect applied: -{final_damage} sanity")
                     
             except Exception as e:
                 logger.error(f"Error applying effect {token}: {e}")
@@ -592,6 +583,46 @@ class InvestigationInteractionView(discord.ui.View):
                 await interaction.response.send_message("조사 인원만 이동할 수 있습니다.", ephemeral=True)
                 return
             
+            # 채널 이동 로직 (A열 노드인 경우)
+            if target_node.get("is_channel", False):
+                guild = interaction.guild
+                target_channel_name = target_node["name"]
+                
+                # 채널 찾기 (이름으로)
+                target_channel = discord.utils.get(guild.text_channels, name=target_channel_name)
+                
+                if target_channel:
+                    # 세션 이동
+                    old_channel_id = self.session.channel_id
+                    
+                    # 세션 정보 업데이트
+                    self.session.channel_id = target_channel.id
+                    self.session.current_location_node = target_node
+                    
+                    # 매핑 업데이트
+                    if old_channel_id in self.cog.sessions:
+                        del self.cog.sessions[old_channel_id]
+                    self.cog.sessions[target_channel.id] = self.session
+                    
+                    await interaction.response.defer()
+                    
+                    # 기존 메시지 정리 (선택사항)
+                    try:
+                        await interaction.message.delete()
+                    except:
+                        pass
+                        
+                    # 새 채널에 멘션 및 조사 화면 출력
+                    member_mentions = ", ".join([f"<@{uid}>" for uid in self.session.members])
+                    await target_channel.send(f"🚀 **장소 이동!**\n{member_mentions}님이 **{target_channel_name}**에 도착했습니다.")
+                    
+                    await self.cog.show_location(target_channel, self.session)
+                    return
+                else:
+                    await interaction.response.send_message(f"❌ 이동할 채널 '{target_channel_name}'을(를) 찾을 수 없습니다.", ephemeral=True)
+                    return
+
+            # 일반 이동 (같은 채널 내)
             self.session.current_location_node = target_node
             await interaction.response.defer()
             await self.cog.show_location(interaction.channel, self.session)

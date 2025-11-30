@@ -1,3 +1,7 @@
+import logging
+
+logger = logging.getLogger('utils.synergy')
+
 class SynergySystem:
     """스탯 시너지 효과 계산"""
     
@@ -5,6 +9,7 @@ class SynergySystem:
     def check_synergies(perception: int, intelligence: int, willpower: int) -> list:
         """활성화된 시너지 목록 반환"""
         synergies = []
+        logger.debug(f"Checking synergies for P:{perception}, I:{intelligence}, W:{willpower}")
         
         # 극단 시너지 (80+)
         if perception >= 80 and intelligence <= 20 and willpower <= 20:
@@ -65,6 +70,8 @@ class SynergySystem:
                 'description': '모든 판정 +20%, 모든 페널티 -20%'
             })
         
+        if synergies:
+            logger.debug(f"Active synergies: {[s['name'] for s in synergies]}")
         return synergies
     
     @staticmethod
@@ -76,9 +83,11 @@ class SynergySystem:
             if synergy['effect'] == 'all_bonus_20':
                 # 완벽한 균형: 성공률 +20% (목표값 -20)
                 modified_target -= 20
+                logger.debug("Applied 'perfect_balance' bonus (-20 to target)")
             
             elif synergy['effect'] == 'danger_auto_success' and context == 'danger_detection':
                 # 극단 관찰자: 위험 감지 자동 성공
                 modified_target = 1  # 무조건 성공
+                logger.debug("Applied 'extreme_observer' bonus (Auto success)")
         
         return modified_target

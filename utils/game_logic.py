@@ -1,4 +1,7 @@
 import random
+import logging
+
+logger = logging.getLogger('utils.game_logic')
 
 class GameLogic:
     @staticmethod
@@ -6,14 +9,18 @@ class GameLogic:
         """
         목표값 계산 공식: 50 - (스탯 - 40) * 0.6
         """
-        return int(50 - (stat - 40) * 0.6)
+        target = int(50 - (stat - 40) * 0.6)
+        logger.debug(f"Calculated target value for stat {stat}: {target}")
+        return target
 
     @staticmethod
     def roll_dice(min_val: int = 1, max_val: int = 100) -> int:
         """
         주사위 굴림 (기본 1d100)
         """
-        return random.randint(min_val, max_val)
+        result = random.randint(min_val, max_val)
+        logger.debug(f"Rolled dice ({min_val}-{max_val}): {result}")
+        return result
 
     @staticmethod
     def calculate_current_stat(base_stat: int, sanity_percent: float) -> int:
@@ -22,7 +29,9 @@ class GameLogic:
         공식: 기본_스탯 * (0.7 + 0.3 * 정신력%)
         sanity_percent는 0.0 ~ 1.0 사이의 값 (예: 100% -> 1.0)
         """
-        return int(base_stat * (0.7 + 0.3 * sanity_percent))
+        current = int(base_stat * (0.7 + 0.3 * sanity_percent))
+        logger.debug(f"Calculated current stat (Base: {base_stat}, Sanity: {sanity_percent:.2f}): {current}")
+        return current
 
     @staticmethod
     def check_result(dice_value: int, target_value: int) -> str:
@@ -33,14 +42,16 @@ class GameLogic:
         - 목표값-89: 성공
         - 90-100: 대성공
         """
+        result = "FAILURE"
         if dice_value < 10:
-            return "CRITICAL_FAILURE" # 대실패
+            result = "CRITICAL_FAILURE" # 대실패
         elif dice_value >= 90:
-            return "CRITICAL_SUCCESS" # 대성공
+            result = "CRITICAL_SUCCESS" # 대성공
         elif dice_value >= target_value:
-            return "SUCCESS" # 성공
-        else:
-            return "FAILURE" # 실패
+            result = "SUCCESS" # 성공
+        
+        logger.debug(f"Check result (Dice: {dice_value}, Target: {target_value}): {result}")
+        return result
 
     @staticmethod
     def calculate_sanity_damage(base_damage: int, current_perception: int) -> int:
@@ -48,7 +59,9 @@ class GameLogic:
         감각에 따른 정신력 피해 증폭
         공식: 기본_피해 * (1 + 현재_감각 * 0.003)
         """
-        return int(base_damage * (1 + current_perception * 0.003))
+        damage = int(base_damage * (1 + current_perception * 0.003))
+        logger.debug(f"Calculated sanity damage (Base: {base_damage}, Perception: {current_perception}): {damage}")
+        return damage
 
     @staticmethod
     def calculate_fear_damage(base_damage: int, current_willpower: int) -> int:
@@ -58,7 +71,9 @@ class GameLogic:
         실제_피해 = 기본_피해 * (1 - 공포_피해_감소율 / 100)
         """
         reduction_percent = current_willpower / 3
-        return int(base_damage * (1 - reduction_percent / 100))
+        damage = int(base_damage * (1 - reduction_percent / 100))
+        logger.debug(f"Calculated fear damage (Base: {base_damage}, Willpower: {current_willpower}): {damage} (Reduction: {reduction_percent:.1f}%)")
+        return damage
 
     @staticmethod
     def calculate_thinking_progress(base_progress: int, current_intelligence: int) -> int:
@@ -66,7 +81,9 @@ class GameLogic:
         지성에 따른 사고화 진행도 증가
         공식: 기본_진행도 * (1 + 지성 / 100)
         """
-        return int(base_progress * (1 + current_intelligence / 100))
+        progress = int(base_progress * (1 + current_intelligence / 100))
+        logger.debug(f"Calculated thinking progress (Base: {base_progress}, Intelligence: {current_intelligence}): {progress}")
+        return progress
 
     @staticmethod
     def check_madness_resistance(current_intelligence: int) -> bool:
@@ -76,7 +93,9 @@ class GameLogic:
         """
         target = GameLogic.calculate_target_value(current_intelligence)
         dice = GameLogic.roll_dice()
-        return dice >= target
+        result = dice >= target
+        logger.debug(f"Madness resistance check (Int: {current_intelligence}, Target: {target}, Dice: {dice}): {result}")
+        return result
 
     @staticmethod
     def check_danger_detection(current_perception: int) -> bool:
@@ -86,7 +105,9 @@ class GameLogic:
         """
         target = GameLogic.calculate_target_value(current_perception)
         dice = GameLogic.roll_dice()
-        return dice >= target
+        result = dice >= target
+        logger.debug(f"Danger detection check (Per: {current_perception}, Target: {target}, Dice: {dice}): {result}")
+        return result
 
     @staticmethod
     def check_pollution_detection(current_perception: int) -> bool:
@@ -96,7 +117,9 @@ class GameLogic:
         """
         target = GameLogic.calculate_target_value(current_perception)
         dice = GameLogic.roll_dice()
-        return dice >= target
+        result = dice >= target
+        logger.debug(f"Pollution detection check (Per: {current_perception}, Target: {target}, Dice: {dice}): {result}")
+        return result
     
     @staticmethod
     def check_incapacitated_evasion(current_willpower: int) -> bool:
@@ -108,4 +131,6 @@ class GameLogic:
         dice = GameLogic.roll_dice()
         # 주사위 결과가 회피 확률보다 작거나 같으면 회피 성공 (낮을수록 좋은 판정인 경우 보통 이렇게 구현하지만, 
         # 여기서는 "확률"이므로 100면체 주사위에서 1~확률 값에 해당하면 성공으로 처리)
-        return dice <= evasion_chance
+        result = dice <= evasion_chance
+        logger.debug(f"Incapacitated evasion check (Will: {current_willpower}, Chance: {evasion_chance}%, Dice: {dice}): {result}")
+        return result

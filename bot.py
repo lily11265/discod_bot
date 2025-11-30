@@ -40,50 +40,33 @@ class RPGBot(commands.Bot):
         """봇 시작 시 Cog 로드 및 초기화"""
         logger.info("Starting bot initialization...")
         
-        # ✅ 구글 시트 워크시트 초기화
-        try:
-            from utils.sheets import SheetsManager
-            sheets = SheetsManager()
-            sheets.initialize_worksheets()
-            logger.info("✅ Google Sheets worksheets initialized")
-        except Exception as e:
-            logger.error(f"❌ Failed to initialize worksheets: {e}")
-        
-        logger.info("Loading cogs...")
-        
-        cogs = [
-            'cogs.log_manager',  # 로그 관리 먼저 로드
+        # Cog 로드
+        initial_extensions = [
+            'cogs.admin',
+            'cogs.investigation',
             'cogs.stats',
             'cogs.survival',
-            'cogs.investigation',
-            'cogs.admin',
-            'cogs.clues'
+            'cogs.clues',
+            'cogs.inventory'
         ]
         
-        for cog in cogs:
+        for extension in initial_extensions:
             try:
-                await self.load_extension(cog)
-                logger.info(f"✅ Loaded: {cog}")
+                await self.load_extension(extension)
+                logger.info(f"Loaded extension: {extension}")
             except Exception as e:
-                logger.error(f"❌ Failed to load {cog}: {e}")
+                logger.error(f"Failed to load extension {extension}: {e}")
         
         # 슬래시 커맨드 동기화
         try:
             synced = await self.tree.sync()
-            logger.info(f"✅ Synced {len(synced)} slash command(s)")
+            logger.info(f"Synced {len(synced)} commands")
         except Exception as e:
-            logger.error(f"❌ Failed to sync commands: {e}")
-    
-    async def on_ready(self):
-        """봇이 준비되었을 때"""
-        logger.info(f'🤖 Logged in as {self.user} (ID: {self.user.id})')
-        logger.info(f'📊 Connected to {len(self.guilds)} guild(s)')
-        logger.info('------')
-        
-        # 봇 상태 메시지 설정
-        await self.change_presence(
-            activity=discord.Game(name="고립무원 | /상태")
-        )
+            logger.error(f"Error syncing commands: {e}")
+            
+        # 로거 설정 (디버그 모드 등)
+        from utils.logger import setup_logger
+        setup_logger()
     
     async def on_command_error(self, ctx, error):
         """명령어 오류 처리"""
