@@ -8,7 +8,6 @@ import logging
 import asyncio
 import datetime
 import config
-from utils.synergy import SynergySystem
 
 logger = logging.getLogger('cogs.investigation')
 
@@ -168,7 +167,7 @@ class Investigation(commands.Cog):
     async def start_investigation(self, channel, members, category_name):
         """실제 조사 시작"""
         # 데이터 로드
-        investigation_data = self.sheets.get_investigation_data()
+        investigation_data = self.sheets.fetch_investigation_data()
         
         # 해당 카테고리(지역) 데이터 찾기
         # world_map의 키가 지역 이름임
@@ -221,17 +220,8 @@ class Investigation(commands.Cog):
                 sanity_percent
             )
             
-            # 시너지 체크
-            synergies = SynergySystem.check_synergies(
-                stats['perception'], 
-                stats['intelligence'], 
-                stats['willpower']
-            )
-            
             # 위험 감지 판정
-            target = GameLogic.calculate_target_value(current_perception)
-            target = SynergySystem.apply_synergy_bonus(target, synergies, 'danger_detection')
-            
+            target = GameLogic.calculate_target_value(current_perception)            
             if GameLogic.check_result(GameLogic.roll_dice(), target) in ["SUCCESS", "CRITICAL_SUCCESS"]:
                 # 위험 정보가 있는지 확인 (node의 메타데이터 또는 조건)
                 if node.get('is_dangerous', False) or "danger" in node.get('tags', []):

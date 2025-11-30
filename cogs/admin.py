@@ -1,6 +1,6 @@
 import discord
 from discord.ext import commands, tasks
-from discord import app_commands
+from discord import Interaction, app_commands
 from utils.sheets import SheetsManager
 from utils.diagnostics import SelfDiagnostics
 import config
@@ -14,7 +14,7 @@ class Admin(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.sheets = SheetsManager()
-        self.bot.investigation_data = self.sheets.get_investigation_data()
+        self.bot.investigation_data = self.sheets.fetch_investigation_data()
         self.sync_task.start()
 
     def cog_unload(self):
@@ -24,77 +24,21 @@ class Admin(commands.Cog):
     async def sync_task(self):
         """매일 03:00에 데이터를 동기화하고 백업합니다."""
         logger.info("Starting scheduled data sync (03:00 AM)...")
-        await self.perform_sync()
-
-    @sync_task.before_loop
-    async def before_sync_task(self):
-        await self.bot.wait_until_ready()
-
-    async def perform_sync(self):
-        """실제 동기화 로직 수행"""
-        try:
-            # 0. DB Manager 가져오기
-            survival_cog = self.bot.get_cog("Survival")
-            if not survival_cog:
-                logger.error("Survival Cog을 찾을 수 없습니다.")
-                return False
-            
-            db_manager = survival_cog.db
-            
-            # ✅ 1. 워크시트 초기화 (없는 시트 생성)
-            logger.info("Checking and initializing worksheets...")
-            self.sheets.initialize_worksheets()
-            
-            # 2. 메타데이터 (ID <-> 이름)
-            self.sheets.get_metadata_map()
-            
-            # 3. 스탯 데이터
-            self.sheets.fetch_all_stats()
-            
-            # 4. 조사 데이터
-            data = self.sheets.fetch_investigation_data()
-            if data:
-                self.bot.investigation_data = data
-                
-            # 5. 아이템 & 광기 데이터 캐싱
-            self.sheets.get_item_data("")
-            self.sheets.get_madness_data("")
-            
-            # 6. 허기 동기화
-            # a. 시트 -> DB (관리자 수동 수정 반영)
-            self.sheets.sync_hunger_from_sheet(db_manager)
-            
-            # b. DB -> 시트 (백업)
-            self.sheets.sync_hunger_to_sheet(db_manager)
-            
-            # 7. 캐시 저장
-            self.sheets.save_cache()
-            
-            logger.info(f"Data sync completed at {datetime.datetime.now()}")
-            return True
-        except Exception as e:
-            logger.error(f"Data sync failed: {e}")
-            return False
-
-    @app_commands.command(name="동기화", description="[관리자] 구글 시트 데이터를 동기화합니다.")
-    async def sheet_sync(self, interaction: discord.Interaction):
-        """
-        구글 시트의 조사 데이터를 읽어와서 봇의 메모리에 로드합니다.
-        """
-        if interaction.user.id not in config.ADMIN_IDS:
-            await interaction.response.send_message("❌ 관리자만 사용할 수 있는 명령어입니다.", ephemeral=True)
+        
+        if Interaction.user.id not in config.ADMIN_IDS:
+            await Interaction.response.send_message("❌ 관리자만 사용할 수 있는 명령어입니다.", ephemeral=True)
             return
 
-        if not interaction.response.is_done():
-            await interaction.response.defer(ephemeral=True)
+        if not Interaction.response.is_done():
+            await Interaction.response.defer(ephemeral=True)
         
         success = await self.perform_sync()
         
         if success:
             data_count = len(self.bot.investigation_data) if self.bot.investigation_data else 0
-            await interaction.followup.send(f"✅ 데이터 동기화 및 캐시 저장 완료! (지역: {data_count}개)", ephemeral=True)
+            await Interaction.followup.send(f"✅ 데이터 동기화 및 캐시 저장 완료! (지역: {data_count}개)", ephemeral=True)
         else:
-            await interaction.followup.send("❌ 동기화 중 오류 발생. 로그를 확인해주세요.", ephemeral=True)
+            await Interaction.followup.send("❌ 동기화 중 오류 발생. 로그를 확인해주세요.", ephemeral=True)
 
     @app_commands.command(name="시스템점검", description="[관리자] 봇의 상태와 데이터 무결성을 점검합니다.")
     async def system_check(self, interaction: discord.Interaction):

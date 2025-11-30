@@ -150,7 +150,27 @@ class Stats(commands.Cog):
         min_val="최솟값 (기본: 1)",
         max_val="최댓값 (기본: 100)",
         stat="판정할 스탯 (선택사항)"
-         
+    )
+    @app_commands.choices(stat=[
+        app_commands.Choice(name="감각", value="감각"),
+        app_commands.Choice(name="지성", value="지성"),
+        app_commands.Choice(name="의지", value="의지")
+    ])
+    async def dice(
+        self,
+        interaction: discord.Interaction,
+        min_val: int = 1,
+        max_val: int = 100,
+        stat: str = None
+    ):
+        """주사위 굴림 및 스탯 판정"""
+        
+        # 일반 주사위 (스탯 판정 없음)
+        if stat is None:
+            result = GameLogic.roll_dice(min_val, max_val)
+            await interaction.response.send_message(f"🎲 주사위 결과: **{result}** ({min_val}-{max_val})")
+            return
+        
         # 판정이 있는 경우: 스탯 판정
         await interaction.response.defer()
         
@@ -180,6 +200,9 @@ class Stats(commands.Cog):
         
         # 목표값 계산
         target_value = GameLogic.calculate_target_value(current_stat_value)
+        
+        # 주사위 굴림
+        result = GameLogic.roll_dice(1, 100)
         
         # 판정
         result_type = GameLogic.check_result(result, target_value)
