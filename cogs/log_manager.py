@@ -3,6 +3,11 @@ from discord.ext import commands, tasks
 import logging
 import os
 from datetime import datetime
+import discord
+from discord.ext import commands, tasks
+import logging
+import os
+from datetime import datetime
 import io
 import time
 
@@ -19,11 +24,11 @@ class LogManager(commands.Cog):
         self.file_handler = None
         self.setup_file_logging()
         
-        # 1시간마다 로그 업로드
-        self.upload_logs_task.start()
+        # 1시간마다 로그 업로드 (비활성화 요청으로 주석 처리)
+        # self.upload_logs_task.start()
     
     def cog_unload(self):
-        self.upload_logs_task.cancel()
+        # self.upload_logs_task.cancel()
         # ✅ 핸들러 제거
         if self.file_handler:
             root_logger = logging.getLogger()
@@ -57,35 +62,40 @@ class LogManager(commands.Cog):
         root_logger.addHandler(self.file_handler)
         logger.info("파일 로그 핸들러 설정 완료")
     
-    @tasks.loop(hours=1)
-    async def upload_logs_task(self):
-        """1시간마다 로그 파일 업로드"""
-        await self.upload_and_clear_logs(auto=True)
+    # @tasks.loop(hours=1)
+    # async def upload_logs_task(self):
+    #     """1시간마다 로그 파일 업로드"""
+    #     await self.upload_and_clear_logs(auto=True)
     
-    @upload_logs_task.before_loop
-    async def before_upload_logs_task(self):
-        await self.bot.wait_until_ready()
+    # @upload_logs_task.before_loop
+    # async def before_upload_logs_task(self):
+    #     await self.bot.wait_until_ready()
     
-    async def upload_and_clear_logs(self, auto=False):
+    async def upload_and_clear_logs(self, target_channel=None, auto=False):
         """로그 파일 업로드 및 삭제"""
         try:
-            guild = self.bot.get_guild(self.log_guild_id)
-            if not guild:
-                logger.error(f"서버 {self.log_guild_id}를 찾을 수 없습니다.")
-                return
-            
-            channel = guild.get_channel(self.log_channel_id)
-            if not channel:
-                logger.error(f"채널 {self.log_channel_id}를 찾을 수 없습니다.")
-                return
+            if target_channel:
+                channel = target_channel
+            else:
+                # 기본 채널 (설정된 경우)
+                guild = self.bot.get_guild(self.log_guild_id)
+                if not guild:
+                    logger.error(f"서버 {self.log_guild_id}를 찾을 수 없습니다.")
+                    return
+                channel = guild.get_channel(self.log_channel_id)
+                if not channel:
+                    logger.error(f"채널 {self.log_channel_id}를 찾을 수 없습니다.")
+                    return
             
             if not os.path.exists(self.log_file_path):
-                logger.warning("업로드할 로그 파일이 없습니다.")
+                if not auto:
+                    await channel.send("⚠️ 업로드할 로그 파일이 없습니다.")
                 return
             
             file_size = os.path.getsize(self.log_file_path)
             if file_size == 0:
-                logger.info("로그 파일이 비어있습니다.")
+                if not auto:
+                    await channel.send("⚠️ 로그 파일이 비어있습니다.")
                 return
             
             # ✅ 파일 핸들러 일시 제거 (파일 잠금 해제)
@@ -156,11 +166,9 @@ class LogManager(commands.Cog):
     @commands.command(name="로그출력")
     async def manual_log_upload(self, ctx):
         """수동 로그 업로드 명령어"""
-        if ctx.channel.id != self.log_channel_id:
-            return
-        
+        # 채널 제한 제거: 어디서든 요청하면 해당 채널로 전송
         await ctx.send("📤 로그 파일 업로드 중...")
-        await self.upload_and_clear_logs(auto=False)
+        await self.upload_and_clear_logs(target_channel=ctx.channel, auto=False)
 
 async def setup(bot):
     await bot.add_cog(LogManager(bot))

@@ -141,24 +141,168 @@ class Survival(commands.Cog):
 
     @tasks.loop(hours=24)
     async def daily_hunger_decay(self):
-        """매일 허기 감소"""
-        # 구현 필요: 모든 유저의 허기를 감소시키고 update_user_stat 호출
-        pass
+        """
+        매일 허기 감소 (Daily Hunger Decay)
+        
+        작동 원리:
+        1. 모든 유저의 목록을 가져옵니다.
+        2. 각 유저의 '의지(Willpower)' 스탯을 기반으로 허기 소모량을 계산합니다.
+           - 공식: 소모량 = 10 + (의지 * 0.04)
+        3. 현재 허기에서 소모량을 차감합니다.
+        4. 변경된 값을 DB와 닉네임에 반영합니다.
+        """
+        try:
+            # 모든 유저 ID 조회
+            users = self.db.fetch_all("SELECT user_id FROM user_state")
+            
+            for (user_id,) in users:
+                # 유저 스탯 조회 (Sheets)
+                stats = self.sheets.get_user_stats(discord_id=str(user_id))
+                if not stats: continue
+                
+                # 소모량 계산
+                willpower = stats.get('willpower', 0)
+                decay = 10 + (willpower * 0.04)
+                
+                # 허기 감소 적용 (음수 허용 안 함, 0까지만)
+                # update_user_stat 내부에서 0 미만 방지 로직이 있음
+                await self.update_user_stat(user_id, 'hunger', -decay)
+                
+            logger.info("Daily hunger decay executed for all users.")
+            
+        except Exception as e:
+            logger.error(f"Error in daily_hunger_decay: {e}")
 
     @tasks.loop(hours=24)
     async def daily_sanity_recovery(self):
-        """매일 정신력 회복 (조건부)"""
-        pass
+        """
+        매일 정신력 회복 (Daily Sanity Recovery)
+        
+        작동 원리:
+        1. 모든 유저를 순회하며 정신력 회복 조건을 확인합니다.
+        2. 조건: 현재 허기가 '회복 임계치' 이상이어야 함.
+           - 임계치 공식: 30 + (지성 * 0.2)
+        3. 조건을 만족하면 정신력을 회복합니다.
+           - 회복량 공식: 5 (기본 자연 회복량, 기획에 따라 조정 가능)
+        4. 조건을 만족하지 못하면(배고픔), 회복하지 않습니다.
+        """
+        try:
+            users = self.db.fetch_all("SELECT user_id, current_hunger FROM user_state")
+            
+            for user_id, current_hunger in users:
+                stats = self.sheets.get_user_stats(discord_id=str(user_id))
+                if not stats: continue
+                
+                intelligence = stats.get('intelligence', 0)
+                
+                # 회복 임계치 계산
+                threshold = 30 + (intelligence * 0.2)
+                
+                if current_hunger >= threshold:
+                    # 조건 만족 시 정신력 회복 (예: +5)
+                    await self.update_user_stat(user_id, 'sanity', 5)
+                else:
+                    # 조건 불만족 (로그만 남김)
+                    pass
+                    
+            logger.info("Daily sanity recovery check executed.")
+            
+        except Exception as e:
+            logger.error(f"Error in daily_sanity_recovery: {e}")
 
     @tasks.loop(hours=24)
     async def daily_madness_recovery_check(self):
-        """매일 광기 회복 체크"""
-        pass
+        """
+        매일 광기 회복 체크 (Daily Madness Recovery Check)
+        
+        작동 원리:
+        1. 광기를 보유한 유저들을 조회합니다.
+        2. 각 광기의 '회복 난이도'와 유저의 '의지'를 비교하여 회복 여부를 판정합니다.
+        3. 판정 성공 시 해당 광기를 제거합니다.
+        """
+        try:
+            # 광기 보유 유저 조회
+            madness_entries = self.db.fetch_all("SELECT id, user_id, madness_id, madness_name FROM user_madness")
+            
+            # 광기 데이터(난이도 등) 로드
+            madness_data_list = self.sheets.get_madness_data()
+            madness_info = {m['madness_id']: m for m in madness_data_list}
+            
+            for entry_id, user_id, madness_id, madness_name in madness_entries:
+                if madness_id not in madness_info: continue
+                
+                info = madness_info[madness_id]
+                difficulty = info.get('recovery_difficulty', '보통') # 쉬움, 보통, 어려움, 불가능 등
+                
+                # 난이도별 목표치 설정 (예시)
+                target = 50
+                if difficulty == '쉬움': target = 30
+                elif difficulty == '어려움': target = 70
+                elif difficulty == '불가능': continue
+                
+                # 유저 의지 스탯 조회
+                stats = self.sheets.get_user_stats(discord_id=str(user_id))
+                if not stats: continue
+                willpower = stats.get('willpower', 0)
+                
+                # 판정 (1d100 + 의지 > 목표)
+                dice = GameLogic.roll_dice()
+                if dice + willpower >= target:
+                    # 회복 성공: DB에서 제거
+                    self.db.execute_query("DELETE FROM user_madness WHERE id = ?", (entry_id,))
+                    
+                    # 유저에게 알림
+                    user = self.bot.get_user(user_id)
+                    if user:
+                        try:
+                            await user.send(f"✨ **광기 회복!**\n안정을 되찾아 '{madness_name}' 증세가 사라졌습니다.")
+                        except: pass
+                        
+            logger.info("Daily madness recovery check executed.")
+            
+        except Exception as e:
+            logger.error(f"Error in daily_madness_recovery_check: {e}")
 
     @tasks.loop(minutes=10)
     async def check_hunger_penalties(self):
-        """허기 0일 때 페널티 적용"""
-        pass
+        """
+        허기 0일 때 페널티 적용 (Hunger Penalty Check)
+        
+        작동 원리:
+        1. 10분마다 실행됩니다.
+        2. 현재 허기가 0인 유저를 찾습니다.
+        3. 해당 유저의 체력을 감소시킵니다. (예: -1 HP)
+        4. 유저에게 경고 메시지를 보냅니다 (너무 자주는 아니게, 쿨타임 적용 가능).
+        """
+        try:
+            # 허기가 0인 유저 조회
+            starving_users = self.db.fetch_all("SELECT user_id, current_hp FROM user_state WHERE current_hunger <= 0")
+            
+            for user_id, current_hp in starving_users:
+                if current_hp <= 0: continue # 이미 행동불능이면 스킵
+                
+                # 체력 감소 (-1)
+                new_hp = await self.update_user_stat(user_id, 'hp', -1)
+                
+                # 사망(행동불능) 체크
+                if new_hp <= 0:
+                    user = self.bot.get_user(user_id)
+                    if user:
+                        try:
+                            await user.send("💀 **아사 직전...**\n배가 너무 고파 쓰러졌습니다. 누군가의 도움이 필요합니다.")
+                        except: pass
+                else:
+                    # 경고 메시지 (확률적으로 또는 쿨타임 두어 발송)
+                    # 여기서는 10% 확률로 경고
+                    if random.random() < 0.1:
+                        user = self.bot.get_user(user_id)
+                        if user:
+                            try:
+                                await user.send("⚠️ **극심한 배고픔**\n배가 너무 고파 체력이 깎이고 있습니다. 무언가를 먹어야 합니다!")
+                            except: pass
+                            
+        except Exception as e:
+            logger.error(f"Error in check_hunger_penalties: {e}")
 
 async def setup(bot):
     await bot.add_cog(Survival(bot))

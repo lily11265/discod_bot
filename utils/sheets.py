@@ -81,47 +81,19 @@ class SheetsManager:
         """
         # 1. 이름 찾기
         pure_name = None
-        metadata = self.get_metadata_map() # 캐시된 메타데이터 사용
-        
+        metadata = self.get_metadata_map()
         if discord_id and str(discord_id) in metadata:
             pure_name = metadata[str(discord_id)]
         elif nickname:
             pure_name = self.parse_nickname(nickname)
-            
-        if not pure_name:
-            return None
-
-        # 2. 캐시 확인
+        if not pure_name: return None
         if 'stats' in self.cached_data:
             for stat in self.cached_data['stats']:
-                if stat['name'] == pure_name:
-                    return stat
+                if stat['name'] == pure_name: return stat
+        return None # 실제 API 호출은 fetch_all_stats나 초기화 때 수행 권장
 
-        # 3. API 호출
-        if not self.client: return None
-
-        try:
-            sheet = self.client.open_by_key(config.SPREADSHEET_ID_A).worksheet("캐릭터 스탯 정리표")
-            data = sheet.get_all_values()
-            
-            for row in data[1:]:
-                if len(row) > 1 and row[0].strip() == pure_name: # A열이 이름
-                    stat_data = {
-                        "name": pure_name,
-                        "hp": int(row[3]) if len(row) > 3 and row[3].isdigit() else 0, # D열
-                        "sanity": int(row[4]) if len(row) > 4 and row[4].isdigit() else 0, # E열
-                        "perception": int(row[5]) if len(row) > 5 and row[5].isdigit() else 0, # F열
-                        "intelligence": int(row[6]) if len(row) > 6 and row[6].isdigit() else 0, # G열
-                        "willpower": int(row[7]) if len(row) > 7 and row[7].isdigit() else 0 # H열
-                    }
-                    return stat_data
-            return None
-        except Exception as e:
-            logger.error(f"Error fetching user stats for {pure_name}: {e}")
-            return None
 
     def fetch_all_stats(self):
-        """[Sheet A] 모든 캐릭터 스탯을 가져와 캐시에 저장"""
         if not self.client: return []
         try:
             sheet = self.client.open_by_key(config.SPREADSHEET_ID_A).worksheet("캐릭터 스탯 정리표")
@@ -140,7 +112,7 @@ class SheetsManager:
             self.cached_data['stats'] = stats_list
             return stats_list
         except Exception as e:
-            logger.error(f"Error fetching all stats: {e}")
+            logger.error(f"Error fetching stats: {e}")
             return []
 
     def sync_hunger_from_sheet(self, db_manager):
@@ -411,12 +383,43 @@ class SheetsManager:
             logger.error(f"Error getting madness data: {e}")
             return []
 
+    def get_clue_combinations(self):
+        """[Sheet B] 단서 조합 레시피 조회"""
+        try:
+            # 시트 이름이 '단서조합'이라고 가정
+            sheet = self.client.open_by_key(config.SPREADSHEET_ID_B).worksheet("단서조합")
+            rows = sheet.get_all_values()
+            recipes = []
+            
+            # 헤더: 조합ID, 필요단서(콤마구분), 결과유형, 결과ID, 메시지
+            for row in rows[1:]:
+                if len(row) >= 5:
+                    recipe_id = row[0].strip()
+                    required_clues = [c.strip() for c in row[1].split(',') if c.strip()]
+                    result_type = row[2].strip() # '단서' or '아이템'
+                    result_id = row[3].strip()
+                    message = row[4].strip()
+                    
+                    if recipe_id and required_clues and result_id:
+                        recipes.append({
+                            "recipe_id": recipe_id,
+                            "required_clues": required_clues,
+                            "result_type": result_type,
+                            "result_id": result_id,
+                            "message": message
+                        })
+            return recipes
+        except Exception as e:
+            # 시트가 없거나 오류 발생 시 빈 리스트 반환 (로그는 디버그 레벨로 낮춤)
+            logger.debug(f"No clue combination sheet found or error: {e}")
+            return []
+
     # =========================================================================
     # 4. Spreadsheet C: 조사/월드맵
     # =========================================================================
 
     def fetch_investigation_data(self):
-        """[Sheet C] 조사 데이터 파싱"""
+        """[Sheet C] 조사 데이터 파싱 (명세서 v1.0 호환)"""
         if not self.client: return {}
         try:
             spreadsheet = self.client.open_by_key(config.SPREADSHEET_ID_C)
@@ -425,6 +428,11 @@ class SheetsManager:
             
             for sheet in worksheets:
                 category_name = sheet.title
+                
+                # 시트 무시 규칙 (예: "설명서", "예시" 등은 스킵할 수 있음)
+                if category_name.startswith("0.") or category_name.startswith("예시"):
+                    continue
+
                 if category_name not in world_map:
                     world_map[category_name] = {
                         "id": category_name,
@@ -434,69 +442,103 @@ class SheetsManager:
                         "items": [],
                         "type": "category"
                     }
+                
                 category_root = world_map[category_name]
                 rows = sheet.get_all_values()
-                last_seen = [""] * 8 
+                last_path = [""] * 5 # A~E fill-down 용
                 
-                for row in rows[1:]:
-                    if not any(row): continue
+                # 헤더 스킵 (1행)
+                for row_idx, row in enumerate(rows[1:]):
+                    # 행 데이터 확보 (최소 17열 Q열까지)
+                    if len(row) < 17:
+                        row += [""] * (17 - len(row))
                     
-                    # Fill Down Logic (A~E)
-                    for i in range(5):
-                        val = row[i].strip() if len(row) > i else ""
-                        if val:
-                            if last_seen[i] != val:
-                                for j in range(i + 1, 8): last_seen[j] = ""
-                            last_seen[i] = val
+                    # 1. 경로 파싱 (A~E)
+                    current_path = [row[i].strip() for i in range(5)]
                     
-                    # F, G, H
-                    for i in range(5, 8):
-                        val = row[i].strip() if len(row) > i else ""
-                        if val: last_seen[i] = val
+                    # 빈 행(데이터 없음) 무시 체크
+                    # A~E가 모두 비어있고 F(아이템)도 비어있으면 빈 행으로 간주
+                    if not any(current_path) and not row[5].strip():
+                        continue
 
-                    location_path = [x for x in last_seen[0:5] if x]
-                    item_name = last_seen[5] # F
-                    button_text = last_seen[6] # G
-                    interaction_type = last_seen[7] # H
+                    # Fill-Down 로직 (A열이 비어있으면 이전 경로 사용)
+                    # 명세서: "장소 하나에 해당하는 행들은 연속된 구간에 몰아서 적는다"
+                    if not current_path[0]:
+                        current_path = list(last_path)
+                    else:
+                        last_path = list(current_path)
                     
-                    if not location_path: continue
+                    # 유효 경로 추출
+                    clean_path = [p for p in current_path if p]
+                    if not clean_path: continue
 
+                    # 2. 트리 구조 생성/탐색
                     current_level = category_root["children"]
                     path_id = category_name
+                    target_location = None
                     
-                    for depth, loc_name in enumerate(location_path):
+                    for depth, loc_name in enumerate(clean_path):
                         path_id = f"{path_id}_{loc_name}"
                         if loc_name not in current_level:
-                            is_channel = (depth == 0)
+                            is_channel = (depth == 0) # 첫 번째 깊이는 채널급
                             current_level[loc_name] = {
                                 "id": path_id,
                                 "name": loc_name,
-                                "description": "",
+                                "description": "", # Q열에서 채움
                                 "children": {},
-                                "items": [], 
+                                "items": [],
                                 "type": "location",
-                                "is_channel": is_channel
+                                "is_channel": is_channel,
+                                "description_variants": []
                             }
                         target_location = current_level[loc_name]
                         current_level = current_level[loc_name]["children"]
                     
-                    variant_data = {
-                        "condition": row[8].strip() if len(row) > 8 else "",
-                        "result_crit_success": row[12].strip() if len(row) > 12 else "",
-                        "result_success": row[13].strip() if len(row) > 13 else "",
-                        "result_fail": row[14].strip() if len(row) > 14 else "",
-                        "result_crit_fail": row[15].strip() if len(row) > 15 else "",
-                        "description": row[16].strip() if len(row) > 16 else ""
-                    }
+                    # 3. 데이터 파싱
+                    item_name = row[5].strip()      # F: 기물 이름
+                    button_text = row[6].strip()    # G: 버튼 텍스트
+                    interaction_type = row[7].strip() # H: 타입
+                    condition = row[8].strip()      # I: 조건
                     
-                    if item_name:
-                        target_location["items"].append({
-                            "name": item_name,
-                            "button_text": button_text,
-                            "type": interaction_type,
-                            "variants": [variant_data]
-                        })
-            
+                    # 결과 및 묘사
+                    # M: 대성공, N: 성공, O: 실패, P: 대실패, Q: 묘사
+                    variant_data = {
+                        "condition": condition,
+                        "result_crit_success": row[12].strip(), # M
+                        "result_success": row[13].strip(),      # N
+                        "result_fail": row[14].strip(),         # O
+                        "result_crit_fail": row[15].strip(),    # P
+                        "description": row[16].strip()          # Q
+                    }
+
+                    # 4. 데이터 적용
+                    if not item_name:
+                        # 기물 이름(F)이 없으면 -> 장소 묘사 행
+                        # "각 장소의 첫 번째 행의 Q열은 그 장소 자체의 묘사"
+                        if not target_location["description"]:
+                            target_location["description"] = variant_data["description"]
+                        else:
+                            # 이미 설명이 있다면 variant로 추가 (조건부 장소 묘사 등)
+                            target_location["description_variants"].append(variant_data)
+                    else:
+                        # 기물 이름(F)이 있으면 -> 상호작용(아이템)
+                        # 기존 아이템 찾기 (이름과 버튼 텍스트가 모두 같아야 같은 그룹)
+                        existing_item = None
+                        for item in target_location["items"]:
+                            if item["name"] == item_name and item["button_text"] == button_text:
+                                existing_item = item
+                                break
+                        
+                        if existing_item:
+                            existing_item["variants"].append(variant_data)
+                        else:
+                            target_location["items"].append({
+                                "name": item_name,
+                                "button_text": button_text,
+                                "type": interaction_type,
+                                "variants": [variant_data]
+                            })
+
             self.cached_data['investigation'] = world_map
             return world_map
         except Exception as e:

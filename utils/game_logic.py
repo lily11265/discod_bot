@@ -35,23 +35,24 @@ class GameLogic:
 
     @staticmethod
     def check_result(dice_value: int, target_value: int) -> str:
-        """
-        판정 결과 반환
-        - 1-9: 대실패
-        - 10-목표값 미만: 실패
-        - 목표값-89: 성공
-        - 90-100: 대성공
-        """
-        result = "FAILURE"
-        if dice_value < 10:
-            result = "CRITICAL_FAILURE" # 대실패
-        elif dice_value >= 90:
-            result = "CRITICAL_SUCCESS" # 대성공
-        elif dice_value >= target_value:
-            result = "SUCCESS" # 성공
-        
-        logger.debug(f"Check result (Dice: {dice_value}, Target: {target_value}): {result}")
-        return result
+            """
+            명세서 기반 판정 결과 반환
+            - M (대성공): 90 ~ 100
+            - P (대실패): 1 ~ 9
+            - N (성공): 목표값 이상 (그리고 대성공 아님)
+            - O (실패): 목표값 미만 (그리고 대실패 아님)
+            """
+            if 90 <= dice_value <= 100:
+                result = "CRITICAL_SUCCESS" # M열
+            elif 1 <= dice_value <= 9:
+                result = "CRITICAL_FAILURE" # P열
+            elif dice_value >= target_value:
+                result = "SUCCESS" # N열
+            else:
+                result = "FAILURE" # O열
+            
+            logger.debug(f"Check result (Dice: {dice_value}, Target: {target_value}): {result}")
+            return result
 
     @staticmethod
     def calculate_sanity_damage(base_damage: int, current_perception: int) -> int:

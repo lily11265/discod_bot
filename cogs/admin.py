@@ -5,7 +5,6 @@ from utils.sheets import SheetsManager
 from utils.diagnostics import SelfDiagnostics
 import config
 import logging
-import json
 import datetime
 
 logger = logging.getLogger('cogs.admin')
@@ -14,38 +13,97 @@ class Admin(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.sheets = SheetsManager()
+        # 봇 시작 시 초기 데이터 로드 (동기화)
         self.bot.investigation_data = self.sheets.fetch_investigation_data()
         self.sync_task.start()
 
     def cog_unload(self):
         self.sync_task.cancel()
 
+    def check_admin_permission(self, user: discord.User):
+        """유저가 관리자 권한(ID 또는 Admin 역할)을 가지고 있는지 확인"""
+        # 1. ID 체크
+        if user.id in config.ADMIN_IDS:
+            return True
+        
+        # 2. 역할 체크 (Member 객체인 경우에만)
+        if isinstance(user, discord.Member):
+            for role in user.roles:
+                if role.name.lower() == "admin":
+                    return True
+        return False
+
     @tasks.loop(time=datetime.time(hour=3, minute=0))
     async def sync_task(self):
         """매일 03:00에 데이터를 동기화하고 백업합니다."""
         logger.info("Starting scheduled data sync (03:00 AM)...")
         
-        if Interaction.user.id not in config.ADMIN_IDS:
-            await Interaction.response.send_message("❌ 관리자만 사용할 수 있는 명령어입니다.", ephemeral=True)
+        # 자동 작업이므로 권한 체크 불필요 (시스템이 수행)
+        success = await self.perform_sync()
+        
+        if success:
+            data_count = len(self.bot.investigation_data) if self.bot.investigation_data else 0
+            logger.info(f"✅ Scheduled sync completed. Loaded {data_count} locations.")
+        else:
+            logger.error("❌ Scheduled sync failed.")
+
+    @app_commands.command(name="동기화", description="[관리자] 구글 시트 데이터를 동기화합니다.")
+    async def sheet_sync(self, interaction: discord.Interaction):
+        """
+        구글 시트의 조사 데이터를 읽어와서 봇의 메모리에 로드합니다.
+        """
+        if not self.check_admin_permission(interaction.user):
+            await interaction.response.send_message("❌ 관리자만 사용할 수 있는 명령어입니다.", ephemeral=True)
             return
 
-        if not Interaction.response.is_done():
-            await Interaction.response.defer(ephemeral=True)
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
         
         success = await self.perform_sync()
         
         if success:
             data_count = len(self.bot.investigation_data) if self.bot.investigation_data else 0
-            await Interaction.followup.send(f"✅ 데이터 동기화 및 캐시 저장 완료! (지역: {data_count}개)", ephemeral=True)
+            await interaction.followup.send(f"✅ 데이터 동기화 및 캐시 저장 완료! (지역: {data_count}개)", ephemeral=True)
         else:
-            await Interaction.followup.send("❌ 동기화 중 오류 발생. 로그를 확인해주세요.", ephemeral=True)
+            await interaction.followup.send("❌ 동기화 중 오류 발생. 로그를 확인해주세요.", ephemeral=True)
+
+    async def perform_sync(self):
+        """실제 동기화 로직 수행"""
+        try:
+            # 1. 시트 데이터 가져오기 & 캐시 저장
+            # 메타데이터, 스탯, 조사 데이터 등을 모두 갱신
+            self.sheets.get_metadata_map() 
+            self.sheets.fetch_all_stats()
+            self.sheets.get_item_data("dummy") # 캐시 웜업용
+            self.sheets.get_madness_data()
+            
+            # 조사 데이터 갱신 및 봇 인스턴스에 적용
+            data = self.sheets.fetch_investigation_data()
+            self.bot.investigation_data = data
+            
+            # DB 동기화 (시트 -> DB 허기 정보 등)
+            survival_cog = self.bot.get_cog("Survival")
+            if survival_cog:
+                db_manager = survival_cog.db
+                self.sheets.sync_hunger_from_sheet(db_manager) # 시트 값 -> DB
+                self.sheets.sync_hunger_to_sheet(db_manager)   # DB 값 -> 시트 (양방향 싱크 고려)
+            else:
+                logger.warning("Survival Cog을 찾을 수 없습니다.")
+
+            # 캐시 파일로 저장
+            self.sheets.save_cache()
+            
+            return True
+        except Exception as e:
+            logger.error(f"Data sync failed: {e}")
+            return False
 
     @app_commands.command(name="시스템점검", description="[관리자] 봇의 상태와 데이터 무결성을 점검합니다.")
     async def system_check(self, interaction: discord.Interaction):
         """
         시스템 상태 점검 명령어
         """
-        if interaction.user.id not in config.ADMIN_IDS:
+        if not self.check_admin_permission(interaction.user):
             await interaction.response.send_message("❌ 관리자만 사용할 수 있는 명령어입니다.", ephemeral=True)
             return
 
@@ -111,7 +169,7 @@ class Admin(commands.Cog):
         """
         필요한 워크시트를 강제로 초기화합니다.
         """
-        if interaction.user.id not in config.ADMIN_IDS:
+        if not self.check_admin_permission(interaction.user):
             await interaction.response.send_message("❌ 관리자만 사용할 수 있는 명령어입니다.", ephemeral=True)
             return
 

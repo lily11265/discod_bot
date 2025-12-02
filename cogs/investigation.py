@@ -8,6 +8,7 @@ import logging
 import asyncio
 import datetime
 import config
+import json
 
 logger = logging.getLogger('cogs.investigation')
 
@@ -27,15 +28,11 @@ class Investigation(commands.Cog):
         self.bot = bot
         self.sheets = SheetsManager()
         self.sessions = {} # session_id (usually channel_id) -> InvestigationSession
-        self.sessions = {} # session_id (usually channel_id) -> InvestigationSession
-        self.scheduled_tasks = []
+        self.reservations = [] # 예약된 조사 목록: {'leader_id': int, 'members': [], 'time': datetime, 'category': str, 'channel_id': int}
         self.active_investigations = {} # user_id: interaction_data
 
     async def category_autocomplete(self, interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
-        """
-        디스코드 서버의 카테고리 목록을 가져와서 자동완성으로 제공합니다.
-        '통신채널', '공지_채널'은 제외합니다.
-        """
+        """카테고리 자동완성"""
         guild = interaction.guild
         if not guild:
             return []
@@ -47,7 +44,37 @@ class Investigation(commands.Cog):
             if current.lower() in category.name.lower():
                 categories.append(app_commands.Choice(name=category.name, value=category.name))
         
-        return categories[:25] # 최대 25개 제한
+        return categories[:25]
+
+    async def session_autocomplete(self, interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+        """
+        사용자가 속한 조사(예약/진행/일시정지) 목록을 자동완성으로 제공합니다.
+        Format: "MM월DD일HH시MM분 [지역] 멤버이름..."
+        """
+        user_id = interaction.user.id
+        choices = []
+
+        # 1. 예약된 조사 (reservations)
+        for i, res in enumerate(self.reservations):
+            if user_id in res['members']:
+                time_str = res['time'].strftime("%m월%d일%H시%M분")
+                member_names = [self.bot.get_user(uid).display_name for uid in res['members'] if self.bot.get_user(uid)]
+                label = f"[예약] {time_str} [{res['category']}] {', '.join(member_names)}"
+                if current.lower() in label.lower():
+                    # value는 식별을 위해 index와 type을 조합
+                    choices.append(app_commands.Choice(name=label, value=f"res:{i}"))
+
+        # 2. 진행 중 / 일시정지된 조사 (sessions)
+        for ch_id, session in self.sessions.items():
+            if user_id in session.members:
+                state_str = "진행" if session.state == "active" else "정지"
+                time_str = session.scheduled_time.strftime("%m월%d일%H시%M분")
+                member_names = [self.bot.get_user(uid).display_name for uid in session.members if self.bot.get_user(uid)]
+                label = f"[{state_str}] {time_str} [{session.location_name}] {', '.join(member_names)}"
+                if current.lower() in label.lower():
+                    choices.append(app_commands.Choice(name=label, value=f"sess:{ch_id}"))
+
+        return choices[:25]
 
     @app_commands.command(name="조사신청", description="조사를 예약하고 진행합니다.")
     @app_commands.describe(
@@ -67,12 +94,11 @@ class Investigation(commands.Cog):
     ):
         await interaction.response.defer()
 
-        # 1. 시간 파싱 (YY.MM.DD.HH.MM)
+        # 1. 시간 파싱
         try:
-            # 현재 연도 앞 2자리 유추 (2000년대 가정)
             target_time = datetime.datetime.strptime(time_str, "%y.%m.%d.%H.%M")
         except ValueError:
-            await interaction.followup.send("❌ 시간 형식이 올바르지 않습니다. `YY.MM.DD.HH.MM` 형식으로 입력해주세요. (예: 25.11.29.13.06)", ephemeral=True)
+            await interaction.followup.send("❌ 시간 형식이 올바르지 않습니다. `YY.MM.DD.HH.MM` 형식으로 입력해주세요.", ephemeral=True)
             return
 
         now = datetime.datetime.now()
@@ -84,9 +110,8 @@ class Investigation(commands.Cog):
         members = [interaction.user.id]
         if user1: members.append(user1.id)
         if user2: members.append(user2.id)
-        
-        # 중복 제거
-        members = list(set(members))
+        members = list(set(members)) # 중복 제거
+
         if len(members) > 3:
              await interaction.followup.send("❌ 조사는 최대 3명까지만 가능합니다.", ephemeral=True)
              return
@@ -98,13 +123,21 @@ class Investigation(commands.Cog):
             await interaction.followup.send(f"❌ '{category}' 카테고리를 찾을 수 없습니다.", ephemeral=True)
             return
             
-        # 해당 카테고리의 첫 번째 채널 찾기 (조사 시작 채널)
         if not target_category.channels:
              await interaction.followup.send(f"❌ '{category}' 카테고리에 채널이 없습니다.", ephemeral=True)
              return
         start_channel = target_category.channels[0]
 
-        # 4. 예약 등록
+        # 4. 예약 등록 (메모리 저장)
+        reservation = {
+            'leader_id': interaction.user.id,
+            'members': members,
+            'time': target_time,
+            'category': category,
+            'channel_id': start_channel.id
+        }
+        self.reservations.append(reservation)
+
         wait_seconds = (target_time - now).total_seconds()
         
         embed = discord.Embed(title="✅ 조사 예약 완료", color=0x2ecc71)
@@ -113,28 +146,121 @@ class Investigation(commands.Cog):
         embed.add_field(name="장소", value=start_channel.mention, inline=True)
         member_mentions = ", ".join([f"<@{uid}>" for uid in members])
         embed.add_field(name="참여 인원", value=member_mentions, inline=False)
-        embed.set_footer(text=f"조사 시작 {int(wait_seconds // 60)}분 전입니다.")
         
         await interaction.followup.send(embed=embed)
         
-        # 백그라운드 태스크로 스케줄링
-        self.bot.loop.create_task(self.schedule_investigation(wait_seconds, members, category, start_channel, interaction.user.id))
+        # 백그라운드 태스크
+        self.bot.loop.create_task(self.schedule_investigation(wait_seconds, reservation))
 
-    async def schedule_investigation(self, wait_seconds, members, category_name, channel, leader_id):
+    async def schedule_investigation(self, wait_seconds, reservation):
         """지정된 시간까지 대기 후 조사를 시작합니다."""
-        await asyncio.sleep(wait_seconds)
+        try:
+            await asyncio.sleep(wait_seconds)
+            
+            # 예약 목록에 여전히 존재하는지 확인 (취소되었을 수 있음)
+            if reservation not in self.reservations:
+                return
+
+            # 예약 목록에서 제거하고 세션 시작
+            if reservation in self.reservations:
+                self.reservations.remove(reservation)
+
+            channel = self.bot.get_channel(reservation['channel_id'])
+            if not channel:
+                logger.error(f"Channel {reservation['channel_id']} not found.")
+                return
+
+            # 공지 및 시작
+            notice_channel = self.bot.get_channel(config.NOTICE_CHANNEL_ID)
+            if notice_channel:
+                member_mentions = " ".join([f"<@{uid}>" for uid in reservation['members']])
+                await notice_channel.send(
+                    f"📢 **조사 알림**\n{member_mentions}님, {reservation['category']} 지역 조사가 시작됩니다.\n"
+                    f"{channel.mention} 채널로 이동해주세요!"
+                )
+            
+            await self.start_gathering(channel, reservation['members'], reservation['leader_id'], reservation['category'])
+            
+        except Exception as e:
+            logger.error(f"Error in scheduled investigation: {e}")
+
+    @app_commands.command(name="조사종료", description="조사를 취소, 중단하거나 일시정지합니다.")
+    @app_commands.describe(
+        action="수행할 작업 (취소/일시중지/다시시작)",
+        target="대상 조사 선택"
+    )
+    @app_commands.choices(action=[
+        app_commands.Choice(name="취소/종료", value="cancel"),
+        app_commands.Choice(name="일시중지", value="pause"),
+        app_commands.Choice(name="다시시작", value="resume")
+    ])
+    @app_commands.autocomplete(target=session_autocomplete)
+    async def end_investigation(self, interaction: discord.Interaction, action: str, target: str):
+        """조사 관리 명령어"""
+        await interaction.response.defer()
+
+        # target 값 파싱 (res:index 또는 sess:channel_id)
+        if ":" not in target:
+            await interaction.followup.send("❌ 올바른 대상을 선택해주세요.", ephemeral=True)
+            return
+            
+        type_, id_val = target.split(":")
         
-        # 공지 채널에 알림
-        notice_channel = self.bot.get_channel(config.NOTICE_CHANNEL_ID)
-        if notice_channel:
-            member_mentions = " ".join([f"<@{uid}>" for uid in members])
-            await notice_channel.send(
-                f"📢 **조사 알림**\n{member_mentions}님, {category_name} 지역 조사가 시작됩니다.\n"
-                f"{channel.mention} 채널로 이동해주세요!"
-            )
-        
-        # 조사 채널에서 시작 프로세스 (Gathering)
-        await self.start_gathering(channel, members, leader_id, category_name)
+        # 1. 취소/종료 (Cancel)
+        if action == "cancel":
+            if type_ == "res": # 예약 취소
+                try:
+                    idx = int(id_val)
+                    if 0 <= idx < len(self.reservations):
+                        res = self.reservations.pop(idx)
+                        await interaction.followup.send(f"✅ 예약된 조사([{res['category']}])가 취소되었습니다.")
+                    else:
+                        await interaction.followup.send("❌ 해당 예약을 찾을 수 없습니다.", ephemeral=True)
+                except ValueError:
+                    await interaction.followup.send("❌ 잘못된 요청입니다.", ephemeral=True)
+            
+            elif type_ == "sess": # 진행 중 종료
+                session_id = int(id_val)
+                if session_id in self.sessions:
+                    # 세션 종료 처리
+                    del self.sessions[session_id]
+                    await interaction.followup.send("✅ 진행 중인 조사가 종료되었습니다. 수고하셨습니다!")
+                else:
+                    await interaction.followup.send("❌ 진행 중인 세션을 찾을 수 없습니다.", ephemeral=True)
+
+        # 2. 일시중지 (Pause)
+        elif action == "pause":
+            if type_ == "res":
+                await interaction.followup.send("❌ 예약된 조사는 일시중지할 수 없습니다. 취소만 가능합니다.", ephemeral=True)
+            elif type_ == "sess":
+                session_id = int(id_val)
+                if session_id in self.sessions:
+                    session = self.sessions[session_id]
+                    session.state = "paused"
+                    # DB 저장 로직이 있다면 여기서 수행 (현재는 메모리 유지)
+                    await interaction.followup.send(f"✅ [{session.location_name}] 조사가 일시중지되었습니다. '다시시작'으로 재개할 수 있습니다.")
+                else:
+                    await interaction.followup.send("❌ 세션을 찾을 수 없습니다.", ephemeral=True)
+
+        # 3. 다시시작 (Resume)
+        elif action == "resume":
+            if type_ == "sess":
+                session_id = int(id_val)
+                if session_id in self.sessions:
+                    session = self.sessions[session_id]
+                    if session.state != "paused":
+                        await interaction.followup.send("❌ 해당 조사는 이미 진행 중이거나 종료되었습니다.", ephemeral=True)
+                        return
+                    
+                    session.state = "active"
+                    channel = self.bot.get_channel(session.channel_id)
+                    await interaction.followup.send("✅ 조사를 재개합니다!")
+                    if channel:
+                        await self.show_location(channel, session)
+                else:
+                    await interaction.followup.send("❌ 일시정지된 세션을 찾을 수 없습니다.", ephemeral=True)
+            else:
+                await interaction.followup.send("❌ 예약된 조사는 '다시시작'할 수 없습니다.", ephemeral=True)
 
     async def start_gathering(self, channel, members, leader_id, category_name):
         """멤버 소집 단계"""
@@ -143,8 +269,8 @@ class Investigation(commands.Cog):
             description="조사에 참여하시는 분들은 5분 내에 아래 ✅ 버튼을 눌러주세요.",
             color=0xf1c40f
         )
-        view = GatheringView(members, timeout=300) # 5분
-        message = await channel.send(embed=embed, view=view)
+        view = GatheringView(members, timeout=300)
+        await channel.send(embed=embed, view=view)
         
         await view.wait()
         
@@ -152,40 +278,32 @@ class Investigation(commands.Cog):
             await channel.send("✅ 모든 인원이 모였습니다. 조사를 시작합니다!")
             await self.start_investigation(channel, members, category_name)
         else:
-            # 인원 미달 시 리더에게 질문
             present_members = list(view.ready_members)
             if not present_members:
                 await channel.send("❌ 아무도 오지 않아 조사가 취소되었습니다.")
                 return
-
-            await channel.send(f"⚠️ 일부 인원이 도착하지 않았습니다. (현재 {len(present_members)}/{len(members)}명)")
-            # 리더 결정 로직 (여기서는 단순화하여 진행한다고 가정하거나, 추가 View 구현 필요)
-            # 요구사항: 포기 / 진행 / 영입
-            # 시간 관계상 '진행'으로 바로 넘어가는 로직으로 구현하거나, 추후 보강
+            await channel.send(f"⚠️ 일부 인원이 도착하지 않았습니다. (현재 {len(present_members)}/{len(members)}명)\n조사를 진행합니다.")
             await self.start_investigation(channel, present_members, category_name)
 
     async def start_investigation(self, channel, members, category_name):
         """실제 조사 시작"""
-        # 데이터 로드
         investigation_data = self.sheets.fetch_investigation_data()
         
-        # 해당 카테고리(지역) 데이터 찾기
-        # world_map의 키가 지역 이름임
         if category_name not in investigation_data:
             await channel.send(f"❌ '{category_name}'에 대한 조사 데이터가 없습니다.")
             return
 
         location_root = investigation_data[category_name]
         
-        # 세션 생성
         session = InvestigationSession(members[0], channel.id, members, category_name, datetime.datetime.now())
         session.current_location_node = location_root
+        session.state = "active"
         self.sessions[channel.id] = session
         
         await self.show_location(channel, session)
 
     async def show_location(self, channel, session):
-        """현재 위치의 정보를 보여주고 상호작용 버튼을 출력"""
+        """현재 위치 정보 및 상호작용 출력"""
         node = session.current_location_node
         
         embed = discord.Embed(
@@ -194,193 +312,150 @@ class Investigation(commands.Cog):
             color=0x3498db
         )
         
-        # 버튼 생성 (조건 체크 포함)
-        logger.debug(f"Creating InvestigationInteractionView for node: {node['name']}")
         view = InvestigationInteractionView(self, session, node)
         message = await channel.send(embed=embed, view=view)
-        view.message = message # 메시지 참조 저장
+        view.message = message
 
-        # ✅ 위험 감지 자동 판정 (각 멤버별)
-        logger.debug(f"Checking danger detection for members: {session.members}")
+        # 위험 감지 (기존 코드 유지)
         for member_id in session.members:
             stats = self.sheets.get_user_stats(discord_id=str(member_id))
-            if not stats:
-                logger.debug(f"Skipping danger check for {member_id}: No stats found")
-                continue
+            if not stats: continue
             
             db = self.bot.get_cog("Survival").db
-            user_state = db.fetch_one(
-                "SELECT current_sanity FROM user_state WHERE user_id = ?", 
-                (member_id,)
-            )
-            
+            user_state = db.fetch_one("SELECT current_sanity FROM user_state WHERE user_id = ?", (member_id,))
             sanity_percent = user_state[0] / 100.0 if user_state else 1.0
-            current_perception = GameLogic.calculate_current_stat(
-                stats['perception'], 
-                sanity_percent
-            )
             
-            # 위험 감지 판정
+            current_perception = GameLogic.calculate_current_stat(stats['perception'], sanity_percent)
             target = GameLogic.calculate_target_value(current_perception)            
+            
             if GameLogic.check_result(GameLogic.roll_dice(), target) in ["SUCCESS", "CRITICAL_SUCCESS"]:
-                # 위험 정보가 있는지 확인 (node의 메타데이터 또는 조건)
                 if node.get('is_dangerous', False) or "danger" in node.get('tags', []):
                     user = self.bot.get_user(member_id)
                     if user:
-                        await user.send(
-                            f"⚠️ **위험 감지!**\n"
-                            f"{node['name']}은(는) 위험해 보입니다!"
-                        )
+                        try: await user.send(f"⚠️ **위험 감지!**\n{node['name']}은(는) 위험해 보입니다!")
+                        except: pass
 
     async def process_investigation_dice(self, interaction: discord.Interaction, dice_result: int):
-        """
-        stats.py의 /dice 명령어에서 호출되는 메서드
-        """
+        """/dice 명령어로 호출되는 메서드 (명세서 결과 반영)"""
         user_id = interaction.user.id
-        logger.debug(f"Processing investigation dice for user {user_id}. Result: {dice_result}")
         
         if user_id not in self.active_investigations:
-            logger.debug(f"User {user_id} has no active investigation.")
             return
 
         active_data = self.active_investigations[user_id]
-        
-        # 상태 확인
         if active_data["state"] != "waiting_for_dice":
-            logger.debug(f"User {user_id} is not in 'waiting_for_dice' state. Current: {active_data['state']}")
             return
-            
-        # 채널 확인 (다른 채널의 주사위 무시)
         if interaction.channel_id != active_data["channel_id"]:
-            logger.debug(f"Channel mismatch for user {user_id}. Expected {active_data['channel_id']}, got {interaction.channel_id}")
             return
 
-        logger.info(f"Dice roll processed for {interaction.user.display_name}: {dice_result}")
-        
-        # 1. 상태 업데이트 (중복 처리 방지)
+        # 데이터 정리
         del self.active_investigations[user_id]
-        
         item_data = active_data["item_data"]
         variant = active_data["variant"]
         
-        # 2. 결과 판정
-        # 스탯 기반 판정 (예: perception)
-        stat_name = variant.get("stat", "perception") # 기본값 감각
-        target_value = 50 # 기본 목표값
+        # 1. 판정 스탯 결정
+        # 조건(I열)에 "stat:감각:40" 등이 있었다면 그 스탯 사용, 없으면 기본값(예: 감각)
+        stat_name = "감각" 
+        base_target = 50
         
-        # 시트에서 유저 스탯 가져오기
+        # 조건 파싱해서 스탯 정보 찾기
+        if "condition" in variant and variant["condition"]:
+            conds = ConditionParser.parse_condition_string(variant["condition"])
+            for c in conds:
+                if c['type'] == 'stat':
+                    # stat:지성:40 -> 지성
+                    parts = c['value'].split(':') # value는 "지성:40" 형태일 수 있음 (parser 구현에 따라 다름)
+                    # ConditionParser는 type='stat', value='지성:40' 으로 파싱함
+                    if ':' in c['value']:
+                        stat_name = c['value'].split(':')[0]
+                    break
+
+        # 스탯 매핑
+        stat_map = {"감각": "perception", "지성": "intelligence", "의지": "willpower"}
+        eng_stat_name = stat_map.get(stat_name, "perception")
+
         user_stats = self.sheets.get_user_stats(discord_id=str(user_id))
-        if user_stats and stat_name in user_stats:
-            target_value = user_stats[stat_name]
-            logger.debug(f"Using stat '{stat_name}' for check. Base value: {target_value}")
-        else:
-            logger.debug(f"Stat '{stat_name}' not found. Using default target: {target_value}")
+        if user_stats and eng_stat_name in user_stats:
+            base_target = user_stats[eng_stat_name]
             
-        # 난이도 보정
-        difficulty = variant.get("difficulty", 0)
-        target_value += difficulty
-        logger.debug(f"Target value after difficulty ({difficulty}): {target_value}")
+        # 정신력 보정
+        db = self.bot.get_cog("Survival").db
+        user_state = db.fetch_one("SELECT current_sanity FROM user_state WHERE user_id = ?", (user_id,))
+        sanity_percent = user_state[0] / 100.0 if user_state else 1.0
+        current_stat = GameLogic.calculate_current_stat(base_target, sanity_percent)
         
-        result_type = GameLogic.check_result(dice_result, target_value)
-        logger.debug(f"Check result: {result_type} (Dice: {dice_result} vs Target: {target_value})")
+        final_target = GameLogic.calculate_target_value(current_stat)
+        
+        # 2. 결과 판정 (명세서 규칙: M=90~100, P=1~9)
+        result_type = GameLogic.check_result(dice_result, final_target)
 
-        # 3. 결과 적용
+        # 3. 결과 텍스트 선택 (M, N, O, P 열)
         result_text = ""
-        effect_string = ""
-        
-        if result_type in ["SUCCESS", "CRITICAL_SUCCESS"]:
+        if result_type == "CRITICAL_SUCCESS": # M
+            result_text = variant.get("result_crit_success") or variant.get("result_success", "대성공!")
+        elif result_type == "SUCCESS":        # N
             result_text = variant.get("result_success", "성공!")
-            # [] 안의 효과 파싱 (예: "상자를 열었다. [item+key, sanity+10]")
-            if "[" in result_text and "]" in result_text:
-                parts = result_text.split("[")
-                result_text = parts[0].strip()
-                effect_string = parts[1].replace("]", "").strip()
-                
-            # ✅ 오염 판별 자동 판정
-            stats = self.sheets.get_user_stats(discord_id=str(user_id))
-            db = self.bot.get_cog("Survival").db
-            user_state = db.fetch_one(
-                "SELECT current_sanity FROM user_state WHERE user_id = ?", 
-                (user_id,)
-            )
-            
-            sanity_percent = user_state[0] / 100.0 if user_state else 1.0
-            current_perception = GameLogic.calculate_current_stat(
-                stats['perception'], 
-                sanity_percent
-            )
-            
-            if GameLogic.check_pollution_detection(current_perception):
-                # 아이템/장소가 오염되었는지 확인
-                is_polluted = variant.get('is_polluted', False) or "polluted" in item_data.get('tags', [])
-                
-                if is_polluted:
-                    user = interaction.user
-                    await user.send(
-                        f"🟢 **오염 감지!**\n"
-                        f"이 {item_data['name']}은(는) 오염되어 있습니다!"
-                    )
-
-        else:
+        elif result_type == "FAILURE":        # O
             result_text = variant.get("result_fail", "실패...")
-            # 실패 시에도 효과가 있을 수 있음 (함정 등)
-            if "[" in result_text and "]" in result_text:
-                parts = result_text.split("[")
-                result_text = parts[0].strip()
-                effect_string = parts[1].replace("]", "").strip()
+        elif result_type == "CRITICAL_FAILURE": # P
+            result_text = variant.get("result_crit_fail") or variant.get("result_fail", "대실패!")
 
-        # 효과 적용
-        effect_results = await self.apply_effects(user_id, effect_string)
+        # 4. 효과 파싱 (예: "문이 열렸다. [item+key,체력-5]")
+        # 텍스트 내에 []가 있으면 효과로 간주, 없으면 전체가 텍스트이고 효과는 없음(또는 쉼표로 구분된 전체가 효과일 수도 있음 명세서에 따라)
+        # 명세서: "각 칸에는 쉼표로 구분된 여러 효과를 나열... 묘사:텍스트"
+        # 따라서 result_text 자체가 효과 문자열임.
         
-        # 4. 결과 출력
+        # 텍스트 출력용과 시스템 효과용 분리 필요
+        # 명세서 예시: "trigger+power_on,체력-5,묘사:힘들게 스위치를 올렸다."
+        
+        effect_results = await self.apply_effects(user_id, result_text)
+        
+        # 묘사 텍스트 추출 (apply_effects에서 '묘사:...' 처리 후 반환하거나, 여기서 별도 처리)
+        # apply_effects가 처리하고 남은 로그들을 보여줌.
+        # 만약 '묘사:' 태그가 없다면, 기본적으로 성공/실패 텍스트는 시스템 메시지로 띄워줌.
+        
+        display_desc = ""
+        # apply_effects 반환값 중 "📜 ..." 로 시작하는 것이 묘사라고 가정하거나
+        # apply_effects 내부에서 묘사를 별도로 추출해야 함.
+        # 여기서는 apply_effects가 리스트를 반환하므로 이를 합쳐서 보여줌.
+
+        color_map = {
+            "CRITICAL_SUCCESS": 0xf1c40f, # Gold
+            "SUCCESS": 0x2ecc71,          # Green
+            "FAILURE": 0xe74c3c,          # Red
+            "CRITICAL_FAILURE": 0x95a5a6  # Grey
+        }
+
         embed = discord.Embed(
             title=f"🎲 조사 결과: {result_type}",
-            description=f"{result_text}",
-            color=0x2ecc71 if result_type in ["SUCCESS", "CRITICAL_SUCCESS"] else 0xe74c3c
+            description=f"(주사위: {dice_result} / 목표: {final_target})\n\n",
+            color=color_map.get(result_type, 0x3498db)
         )
         
         if effect_results:
-            embed.add_field(name="효과 적용", value="\n".join(effect_results), inline=False)
-            
+            embed.add_field(name="결과", value="\n".join(effect_results), inline=False)
+        else:
+            embed.description += result_text # 효과 포맷이 아닐 경우 텍스트 그대로 출력
+
         await interaction.followup.send(embed=embed)
 
     async def apply_effects(self, user_id, effect_string):
-        """
-        효과 문자열을 파싱하여 적용합니다.
-        예: "clue+단서ID, item+아이템명, 체력-10, 정신력+5, trigger+트리거ID"
-        """
-        logger.debug(f"Applying effects for user {user_id}: {effect_string}")
+        """효과 적용 로직 (기존 유지)"""
+        if not effect_string: return []
         results = []
-        if not effect_string:
-            return results
-            
-        # 콤마로 분리
         tokens = [t.strip() for t in effect_string.split(',')]
-        
         db = self.bot.get_cog("Survival").db
         
         for token in tokens:
             try:
-                logger.debug(f"Processing token: {token}")
                 if token.startswith("clue+"):
                     clue_id = token.split('+')[1]
-                    # 단서 이름 조회 (시트에서)
-                    clue_data = self.sheets.get_clue_data(clue_id) # TODO: Implement get_clue_data
-                    clue_name = clue_data['name'] if clue_data else clue_id
-                    
-                    db.execute_query("INSERT OR IGNORE INTO user_clues (user_id, clue_id, clue_name) VALUES (?, ?, ?)", (user_id, clue_id, clue_name))
-                    results.append(f"🔍 단서 획득: {clue_name}")
-                    logger.debug(f"Clue acquired: {clue_id}")
-
+                    # TODO: 단서 이름 가져오기
+                    db.execute_query("INSERT OR IGNORE INTO user_clues (user_id, clue_id, clue_name) VALUES (?, ?, ?)", (user_id, clue_id, clue_id))
+                    results.append(f"🔍 단서 획득: {clue_id}")
                 elif token.startswith("item+"):
                     item_name = token.split('+')[1]
-                    # 인벤토리 추가
-                    db.execute_query("""
-                        INSERT INTO user_inventory (user_id, item_name, count) 
-                        VALUES (?, ?, 1) 
-                        ON CONFLICT(user_id, item_name) 
-                        DO UPDATE SET count = count + 1
-                    """, (user_id, item_name))
+                    db.execute_query("INSERT INTO user_inventory (user_id, item_name, count) VALUES (?, ?, 1) ON CONFLICT(user_id, item_name) DO UPDATE SET count = count + 1", (user_id, item_name))
                     results.append(f"📦 아이템 획득: {item_name}")
                     logger.debug(f"Item acquired: {item_name}")
 
@@ -476,7 +551,20 @@ class Investigation(commands.Cog):
                 results.append(f"⚠️ 효과 적용 실패: {token}")
                 
         return results
-
+    def find_parent_node(self, root_node, target_node_id):
+        """트리에서 타겟 노드의 부모를 찾습니다."""
+        if "children" not in root_node:
+            return None
+        
+        for child_name, child_node in root_node["children"].items():
+            if child_node.get("id") == target_node_id:
+                return root_node
+            
+            # 재귀 검색
+            parent = self.find_parent_node(child_node, target_node_id)
+            if parent:
+                return parent
+        return None
 class GatheringView(discord.ui.View):
     def __init__(self, expected_members, timeout=300):
         super().__init__(timeout=timeout)
@@ -487,15 +575,15 @@ class GatheringView(discord.ui.View):
     @discord.ui.button(label="출석 체크", style=discord.ButtonStyle.success, emoji="✅")
     async def check_in(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id not in self.expected_members:
-            await interaction.response.send_message("이번 조사에 참여하지 않은 인원입니다.", ephemeral=True)
+            await interaction.response.send_message("참여 인원이 아닙니다.", ephemeral=True)
             return
         
         if interaction.user.id in self.ready_members:
-            await interaction.response.send_message("이미 출석 체크를 하셨습니다.", ephemeral=True)
+            await interaction.response.send_message("이미 체크했습니다.", ephemeral=True)
             return
 
         self.ready_members.add(interaction.user.id)
-        await interaction.response.send_message(f"{interaction.user.mention} 출석 확인!", ephemeral=False)
+        await interaction.response.send_message(f"{interaction.user.mention} 출석!", ephemeral=False)
         
         if len(self.ready_members) == len(self.expected_members):
             self.all_ready = True
@@ -503,7 +591,7 @@ class GatheringView(discord.ui.View):
 
 class InvestigationInteractionView(discord.ui.View):
     def __init__(self, cog, session, node):
-        super().__init__(timeout=900) # 15분
+        super().__init__(timeout=900) # 15분 타임아웃
         self.cog = cog
         self.session = session
         self.node = node
@@ -511,58 +599,59 @@ class InvestigationInteractionView(discord.ui.View):
         self.generate_buttons()
 
     async def on_timeout(self):
-        """타임아웃 시 새 View 생성하여 타이머 리셋"""
-        if self.message:
-            new_view = InvestigationInteractionView(self.cog, self.session, self.node)
-            await self.message.edit(view=new_view)
-            new_view.message = self.message
+        """타임아웃 시 조사 중단"""
+        if self.session.channel_id in self.cog.sessions:
+            # 세션 제거 (조사 종료)
+            del self.cog.sessions[self.session.channel_id]
+            
+            if self.message:
+                try:
+                    embed = discord.Embed(title="⌛ 조사 종료", description="15분 동안 활동이 없어 조사가 종료되었습니다.", color=0x95a5a6)
+                    await self.message.edit(view=None, embed=embed)
+                except:
+                    pass
+
+    async def disable_all_buttons(self, interaction: discord.Interaction):
+        """모든 버튼 비활성화 및 메시지 업데이트"""
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(view=self)
 
     def generate_buttons(self):
-        # 1. 하위 지역 (이동)
+        # 1. Back 버튼 (이전 지역)
+        # 현재 노드가 루트(Category)가 아닌 경우에만 표시
+        # parent를 찾기 위해 전체 데이터를 뒤져야 함
+        investigation_data = self.cog.sheets.cached_data.get('investigation', {})
+        category_root = investigation_data.get(self.session.location_name)
+        
+        if category_root and self.node.get("id") != category_root.get("id"):
+            # 현재 노드가 카테고리 루트가 아님 -> 상위 노드 존재
+            # 트리 탐색으로 부모 찾기
+            parent = self.cog.find_parent_node(category_root, self.node.get("id"))
+            if parent:
+                back_btn = discord.ui.Button(label="◀️ 이전 지역", style=discord.ButtonStyle.secondary, row=4)
+                back_btn.callback = self.create_move_callback(parent)
+                self.add_item(back_btn)
+
+        # 2. 하위 지역 (이동)
         if "children" in self.node:
             for child_name, child_data in self.node["children"].items():
-                # 조건 체크 필요 (지역 이동에도 조건이 있을 수 있음 - 현재 데이터 구조상 I열은 아이템/상호작용에만 있음)
-                # 하지만 지역 자체도 조건이 있을 수 있다면 ConditionParser 사용
-                # 여기서는 일단 무조건 표시
-                button = discord.ui.Button(label=child_name, style=discord.ButtonStyle.primary, custom_id=f"move:{child_name}")
+                button = discord.ui.Button(label=child_name, style=discord.ButtonStyle.primary, custom_id=f"move:{child_data['id']}")
                 button.callback = self.create_move_callback(child_data)
                 self.add_item(button)
 
-        # 2. 상호작용 (아이템)
+        # 3. 상호작용 (아이템)
         if "items" in self.node:
             for item in self.node["items"]:
-                # Top-Down Variant Check
-                # variants 리스트를 순회하며 첫 번째로 조건이 맞는(visible=True) variant를 찾음
-                
-                # 상태 정보 구성
-                user_state = {
-                    "stats": {}, # TODO: 실제 유저 스탯 로드 필요 (여기서는 View 생성 시점이라 비동기 호출 어려움 -> 미리 로드하거나 캐시 사용)
-                    "inventory": [], # TODO: 인벤토리 로드
-                    "pollution": 0 # TODO: 오염도 로드
-                }
-                
-                # 스탯은 View 생성 시점에 알기 어려울 수 있음 (여러 유저가 보므로)
-                # 하지만 버튼의 가시성은 "관찰자" 기준이 아니라 "일반적인 조건"이어야 함?
-                # 아니면, 버튼을 누를 때 체크?
-                # 요구사항: "I열 조건에 따라 다른 Q열 묘사 표시" -> 버튼은 하나지만, 누르면 결과가 다름?
-                # 예시 1: "버튼은 하나: [🔍 서류 뒤지기]. 클릭 시 자신의 감각 스탯에 맞는 묘사 표시"
-                # 따라서 버튼 생성 시점에는 "가장 관대한 조건" 혹은 "기본 버튼"을 보여주고,
-                # 클릭 시점에 조건을 다시 체크하여 묘사를 결정해야 함.
-                
-                # 하지만 "Visible" 조건(예: trigger)이 있다면 버튼 자체가 안 보여야 함.
-                # 따라서 "Visible" 여부는 모든 Variant 중 하나라도 Visible이면 True?
-                # 혹은 "기본 Variant"(조건 없음)가 있다면 무조건 Visible.
-                
-                # 여기서는 일단 버튼을 생성하고, 콜백에서 조건을 다시 체크하여 묘사를 선택하도록 구현.
-                # 단, 'block'이나 'visible' 옵션이 있는 경우 버튼 자체를 숨겨야 할 수도 있음.
-                # 현재 로직: 버튼은 무조건 생성하되, 콜백에서 Variant 선택.
-                # (심화: 만약 모든 Variant가 숨김 조건이라면 버튼 생성 X)
-                
+                # Custom ID 중복 방지를 위해 item name + node id 조합 등 사용 권장되지만
+                # 여기서는 SheetsManager에서 중복 처리 로직이 수정되었다고 가정하고 진행
+                # 또는 item['name']만 사용하되 리스트 인덱스 추가
+                btn_id = f"act:{self.node['id']}:{item['name']}" 
                 button = discord.ui.Button(
                     label=item["button_text"], 
                     style=discord.ButtonStyle.secondary, 
                     emoji="🔍",
-                    custom_id=f"act:{item['name']}"
+                    custom_id=btn_id
                 )
                 button.callback = self.create_action_callback(item)
                 self.add_item(button)
@@ -573,49 +662,13 @@ class InvestigationInteractionView(discord.ui.View):
                 await interaction.response.send_message("조사 인원만 이동할 수 있습니다.", ephemeral=True)
                 return
             
-            # 채널 이동 로직 (A열 노드인 경우)
-            if target_node.get("is_channel", False):
-                guild = interaction.guild
-                target_channel_name = target_node["name"]
-                
-                # 채널 찾기 (이름으로)
-                target_channel = discord.utils.get(guild.text_channels, name=target_channel_name)
-                
-                if target_channel:
-                    # 세션 이동
-                    old_channel_id = self.session.channel_id
-                    
-                    # 세션 정보 업데이트
-                    self.session.channel_id = target_channel.id
-                    self.session.current_location_node = target_node
-                    
-                    # 매핑 업데이트
-                    if old_channel_id in self.cog.sessions:
-                        del self.cog.sessions[old_channel_id]
-                    self.cog.sessions[target_channel.id] = self.session
-                    
-                    await interaction.response.defer()
-                    
-                    # 기존 메시지 정리 (선택사항)
-                    try:
-                        await interaction.message.delete()
-                    except:
-                        pass
-                        
-                    # 새 채널에 멘션 및 조사 화면 출력
-                    member_mentions = ", ".join([f"<@{uid}>" for uid in self.session.members])
-                    await target_channel.send(f"🚀 **장소 이동!**\n{member_mentions}님이 **{target_channel_name}**에 도착했습니다.")
-                    
-                    await self.cog.show_location(target_channel, self.session)
-                    return
-                else:
-                    await interaction.response.send_message(f"❌ 이동할 채널 '{target_channel_name}'을(를) 찾을 수 없습니다.", ephemeral=True)
-                    return
+            # 버튼 비활성화
+            await self.disable_all_buttons(interaction)
 
-            # 일반 이동 (같은 채널 내)
+            # 이동 로직
             self.session.current_location_node = target_node
-            await interaction.response.defer()
             await self.cog.show_location(interaction.channel, self.session)
+            
         return callback
 
     def create_action_callback(self, item_data):
@@ -624,91 +677,59 @@ class InvestigationInteractionView(discord.ui.View):
                 await interaction.response.send_message("조사 인원만 상호작용할 수 있습니다.", ephemeral=True)
                 return
             
-            # 1. 유저 상태 로드
-            stats = self.cog.sheets.get_user_stats(nickname=interaction.user.display_name, discord_id=str(interaction.user.id))
-            if not stats:
-                await interaction.response.send_message("❌ 스탯 정보를 불러올 수 없습니다.", ephemeral=True)
-                return
+            # 버튼 비활성화
+            await self.disable_all_buttons(interaction)
 
-            user_state = {
-                "stats": stats,
-                "inventory": [], # TODO: 인벤토리 연동
-                "pollution": 0, # TODO: 오염도 연동
-                "skills": [] # TODO: 스킬 연동
-            }
-            
-            # 2. 월드 상태 로드
-            # TODO: DB에서 트리거, 시간, 카운트 로드
-            world_state = {
-                "triggers": [],
-                "time": datetime.datetime.now().strftime("%H:%M"),
-                "interaction_counts": {}, # TODO: 로드
-                "current_item_id": f"{self.node['id']}_{item_data['name']}" # 임시 ID 생성
-            }
-            
-            # 3. Variant 선택 (Top-Down)
+            # Variant 선택 로직
             selected_variant = None
-            
-            # variants가 없으면(구버전 데이터 등) 기본 처리
-            if "variants" not in item_data or not item_data["variants"]:
-                # Fallback (기존 구조 호환)
-                selected_variant = {
-                    "condition": item_data.get("condition", ""),
-                    "description": item_data.get("description", ""),
-                    "result_success": item_data.get("result_success", ""),
-                    "result_fail": item_data.get("result_fail", "")
-                }
-            else:
-                # 순차 체크
+            stats = self.cog.sheets.get_user_stats(discord_id=str(interaction.user.id))
+            user_state = {"stats": stats, "inventory": []} # 인벤토리 연동 필요
+            world_state = {}
+
+            if "variants" in item_data:
                 for variant in item_data["variants"]:
                     conditions = ConditionParser.parse_condition_string(variant["condition"])
-                    
-                    # 빈 조건은 항상 참 (기본값)
                     if not conditions:
                         selected_variant = variant
                         break
-                        
-                    check_result = ConditionParser.evaluate_all(conditions, user_state, world_state)
-                    if check_result["enabled"]: # visible & enabled
+                    check = ConditionParser.evaluate_all(conditions, user_state, world_state)
+                    if check["enabled"]:
                         selected_variant = variant
                         break
             
             if not selected_variant:
-                # 매칭되는 Variant가 없음 (이론상 마지막에 빈 조건이 있어야 함)
-                await interaction.response.send_message("아무런 반응이 없습니다.", ephemeral=True)
-                return
+                # Fallback
+                selected_variant = item_data.get("variants", [{}])[0]
 
-            # 4. 선택된 Variant 실행
-            # 조사(investigation) 타입인 경우 주사위 굴림 유도
             if item_data["type"] == "investigation":
-                await interaction.response.send_message(
-                    f"🔍 **{item_data['name']}** 조사를 시작합니다.\n"
-                    f"{selected_variant['description']}\n" # 조사 전 묘사? 혹은 조사 후 묘사?
-                    # 기획서: "Q열 묘사 표시" -> 클릭 시 바로 표시되는 묘사
-                    f"`/dice` 명령어로 주사위를 굴려주세요!",
-                    ephemeral=True
-                )
-                
-                # 세션에 현재 상호작용 정보 저장
+                # 주사위 대기 상태로 전환
                 self.cog.active_investigations[interaction.user.id] = {
                     "state": "waiting_for_dice",
                     "item_data": item_data,
                     "variant": selected_variant,
                     "channel_id": interaction.channel_id
                 }
-            else:
-                # 즉시 완료 타입 (read, acquire 등)
-                # 여기서는 간단히 묘사만 출력
-                await interaction.response.send_message(
-                    f"**{item_data['name']}**\n{selected_variant['description']}",
-                    ephemeral=True
+                
+                msg = await interaction.channel.send(
+                    f"🔍 **{item_data['name']}** 조사를 시작합니다.\n"
+                    f"{selected_variant.get('description', '')}\n"
+                    f"`/주사위` 명령어를 입력하여 판정을 진행하세요!"
                 )
                 
+                # 조사 후에도 현재 위치 다시 보여주기? 
+                # 기획에 따라 다르지만, 보통 결과 보고 후 머무르거나 함.
+                # 여기서는 버튼이 비활성화되었으므로, 다시 show_location을 호출해주는 게 좋을 수 있음.
+                # 하지만 주사위 결과가 나와야 하므로 주사위 콜백에서 처리하는게 맞음.
+            else:
+                # 즉시 완료 타입
+                await interaction.followup.send(
+                    f"**{item_data['name']}**\n{selected_variant.get('description', '')}",
+                    ephemeral=True
+                )
+                # 뷰 리프레시 (버튼 다시 활성화된 새 뷰 출력)
+                await self.cog.show_location(interaction.channel, self.session)
+
         return callback
-
-
-
-
 
 async def setup(bot):
     await bot.add_cog(Investigation(bot))

@@ -145,7 +145,7 @@ class Stats(commands.Cog):
         
         await interaction.followup.send(embed=embed, view=view)
 
-    @app_commands.command(name="주사위", description="주사위를 굴립니다. 판정 옵션으로 스탯 판정도 가능합니다.")
+    @app_commands.command(name="주사위", description="주사위를 굴립니다. 조사 중이라면 판정에 사용됩니다.")
     @app_commands.describe(
         min_val="최솟값 (기본: 1)",
         max_val="최댓값 (기본: 100)",
@@ -165,13 +165,25 @@ class Stats(commands.Cog):
     ):
         """주사위 굴림 및 스탯 판정"""
         
-        # 일반 주사위 (스탯 판정 없음)
+        # 1. 주사위 굴림
+        result = GameLogic.roll_dice(min_val, max_val)
+        
+        # 2. 조사 시스템 연동 확인
+        inv_cog = self.bot.get_cog("Investigation")
+        if inv_cog and interaction.user.id in inv_cog.active_investigations:
+            # 조사 판정 대기 중인 경우 해당 로직으로 넘김
+            active_data = inv_cog.active_investigations[interaction.user.id]
+            if active_data["channel_id"] == interaction.channel_id:
+                await interaction.response.defer() # 조사 로직에서 followup 사용
+                await inv_cog.process_investigation_dice(interaction, result)
+                return
+
+        # 3. 일반 주사위 또는 단순 스탯 판정 (조사 아님)
         if stat is None:
-            result = GameLogic.roll_dice(min_val, max_val)
             await interaction.response.send_message(f"🎲 주사위 결과: **{result}** ({min_val}-{max_val})")
             return
         
-        # 판정이 있는 경우: 스탯 판정
+        # 판정이 있는 경우: 단순 스탯 판정
         await interaction.response.defer()
         
         stats = self.sheets.get_user_stats(discord_id=str(interaction.user.id))
@@ -179,61 +191,25 @@ class Stats(commands.Cog):
             await interaction.followup.send("❌ 스탯 정보를 불러올 수 없습니다.", ephemeral=True)
             return
         
-        # 스탯 매핑
-        stat_map = {
-            "감각": "perception",
-            "지성": "intelligence",
-            "의지": "willpower"
-        }
+        stat_map = {"감각": "perception", "지성": "intelligence", "의지": "willpower"}
+        base_stat_value = stats.get(stat_map.get(stat), 0)
         
-        base_stat_value = stats[stat_map[stat]]
-        
-        # 정신력 반영
+        # 정신력 반영 등 기존 로직 수행
         db = self.bot.get_cog("Survival").db
-        user_state = db.fetch_one(
-            "SELECT current_sanity FROM user_state WHERE user_id = ?",
-            (interaction.user.id,)
-        )
-        
+        user_state = db.fetch_one("SELECT current_sanity FROM user_state WHERE user_id = ?", (interaction.user.id,))
         sanity_percent = user_state[0] / 100.0 if user_state else 1.0
         current_stat_value = GameLogic.calculate_current_stat(base_stat_value, sanity_percent)
-        
-        # 목표값 계산
         target_value = GameLogic.calculate_target_value(current_stat_value)
         
-        # 주사위 굴림
-        result = GameLogic.roll_dice(1, 100)
-        
-        # 판정
         result_type = GameLogic.check_result(result, target_value)
         
-        # 결과 임베드
         embed = discord.Embed(
             title=f"🎲 {stat} 판정",
             color=0x2ecc71 if "SUCCESS" in result_type else 0xe74c3c
         )
-        
         embed.add_field(name="주사위", value=f"**{result}**", inline=True)
         embed.add_field(name="목표값", value=f"{target_value}", inline=True)
-        embed.add_field(
-            name="현재 스탯", 
-            value=f"{current_stat_value} (기본: {base_stat_value})",
-            inline=True
-        )
-        
-        # 판정 결과
-        result_text = {
-            "CRITICAL_SUCCESS": "🌟 **대성공!**",
-            "SUCCESS": "✅ **성공**",
-            "FAILURE": "❌ **실패**",
-            "CRITICAL_FAILURE": "💀 **대실패!**"
-        }
-        
-        embed.add_field(
-            name="판정 결과",
-            value=result_text[result_type],
-            inline=False
-        )
+        embed.add_field(name="결과", value=result_type, inline=False)
         
         await interaction.followup.send(embed=embed)
 

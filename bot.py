@@ -5,16 +5,11 @@ import os
 import logging
 import asyncio
 
-# 로깅 설정
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler()  # 콘솔 출력
-        # 파일 핸들러는 LogManager에서 추가
-    ]
-)
+# ✅ 수정됨: 로깅 설정 중복 제거
+# logging.basicConfig(...) 제거하고 utils.logger.setup_logger()만 사용
+from utils.logger import setup_logger
 logger = logging.getLogger('discord_bot')
+setup_logger()
 
 # 인텐트 설정 (필요한 권한 활성화)
 intents = discord.Intents.default()
@@ -47,7 +42,8 @@ class RPGBot(commands.Bot):
             'cogs.stats',
             'cogs.survival',
             'cogs.clues',
-            'cogs.inventory'
+            'cogs.inventory',
+            'cogs.log_manager' # 로그 매니저도 여기에 포함되어 있어야 함
         ]
         
         for extension in initial_extensions:
@@ -63,10 +59,6 @@ class RPGBot(commands.Bot):
             logger.info(f"Synced {len(synced)} commands")
         except Exception as e:
             logger.error(f"Error syncing commands: {e}")
-            
-        # 로거 설정 (디버그 모드 등)
-        from utils.logger import setup_logger
-        setup_logger()
     
     async def on_command_error(self, ctx, error):
         """명령어 오류 처리"""
