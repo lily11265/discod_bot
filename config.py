@@ -1,23 +1,3 @@
-import os
-from dotenv import load_dotenv
-
-# .env 파일 로드
-load_dotenv()
-
-# 디스코드 봇 토큰
-import os
-from dotenv import load_dotenv
-
-# .env 파일 로드
-load_dotenv()
-
-# 디스코드 봇 토큰
-import os
-from dotenv import load_dotenv
-
-# .env 파일 로드
-load_dotenv()
-
 # 디스코드 봇 토큰
 import os
 from dotenv import load_dotenv
@@ -45,3 +25,4 @@ ADMIN_IDS = [1090546247770832910]
 
 # 조사 공지 채널 ID
 NOTICE_CHANNEL_ID = int(os.getenv('NOTICE_CHANNEL_ID', '0'))
+
