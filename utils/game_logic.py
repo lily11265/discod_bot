@@ -58,9 +58,9 @@ class GameLogic:
     def calculate_sanity_damage(base_damage: int, current_perception: int) -> int:
         """
         감각에 따른 정신력 피해 증폭
-        공식: 기본_피해 * (1 + 현재_감각 * 0.003)
+        공식: 기본_피해 * (1 + 현재_감각 * 0.005)
         """
-        damage = int(base_damage * (1 + current_perception * 0.003))
+        damage = int(base_damage * (1 + current_perception * 0.005))
         logger.debug(f"Calculated sanity damage (Base: {base_damage}, Perception: {current_perception}): {damage}")
         return damage
 
@@ -135,3 +135,134 @@ class GameLogic:
         result = dice <= evasion_chance
         logger.debug(f"Incapacitated evasion check (Will: {current_willpower}, Chance: {evasion_chance}%, Dice: {dice}): {result}")
         return result
+
+    @staticmethod
+    def calculate_hunger_penalty(stat_value: int, hunger_zero_days: int) -> int:
+        """
+        허기 0 지속 일수에 따른 스탯 페널티 계산
+        - 0~2일: -5%
+        - 3~6일: -10%
+        - 7일 이상: 행동불능 (스탯 영향은 -10% 유지하거나 별도 처리, 여기서는 -10%로 계산)
+        """
+        penalty_percent = 0
+        if hunger_zero_days >= 3:
+            penalty_percent = 10
+        elif hunger_zero_days >= 0: # 0일차부터 적용 (Case 2)
+            penalty_percent = 5
+            
+        penalty = int(stat_value * (penalty_percent / 100))
+        effective_stat = max(0, stat_value - penalty)
+        
+        logger.debug(f"Calculated hunger penalty (Stat: {stat_value}, Days: {hunger_zero_days}): {effective_stat} (Penalty: {penalty_percent}%)")
+        return effective_stat
+
+    @staticmethod
+    def check_ritual_result(results: list[str], ritual_type: str) -> str:
+        """
+        의례 성공 여부 판정
+        results: ["SUCCESS", "FAILURE", "CRITICAL_SUCCESS", "CRITICAL_FAILURE", ...]
+        ritual_type: "1_person", "2_person", "3_person"
+        """
+        success_count = results.count("SUCCESS") + results.count("CRITICAL_SUCCESS")
+        crit_success_count = results.count("CRITICAL_SUCCESS")
+        crit_fail_count = results.count("CRITICAL_FAILURE")
+        total = len(results)
+
+        if ritual_type == "1_person":
+            # 3개 판정 모두 성공해야 성공
+            if success_count == 3:
+                if crit_success_count == 3: return "CRITICAL_SUCCESS"
+                return "SUCCESS"
+            if crit_fail_count > 0: return "CRITICAL_FAILURE"
+            return "FAILURE"
+
+        elif ritual_type == "2_person":
+            # 성공 조건: 한 명만 대성공~성공이고 다른 한 명은 대실패만 안하면 성공.
+            # 둘 다 대성공일시 대성공.
+            if total != 2: return "FAILURE"
+            
+            if crit_success_count == 2:
+                return "CRITICAL_SUCCESS"
+            
+            # 한 명 성공(이상) + 다른 한 명 대실패 아님
+            if success_count >= 1 and crit_fail_count == 0:
+                return "SUCCESS"
+            
+            if crit_fail_count > 0:
+                return "CRITICAL_FAILURE"
+            
+            return "FAILURE"
+
+        elif ritual_type == "3_person":
+            # 성공 조건: 두 명 이상이 성공일시 성공
+            # 대성공 조건: 대성공이 2명 이상일시 대성공
+            # 실패 조건: 대실패가 한 명이라도 있으면 실패
+            # 대실패 조건: 대실패가 두 명 이상일시 대실패
+            # 특수 케이스: 한 명이 대성공이고 다른 두 명이 각각 성공, 실패일 경우 성공으로 판단
+            
+            # 대실패 우선 체크 (2명 이상 -> 대실패)
+            if crit_fail_count >= 2: return "CRITICAL_FAILURE"
+            # 대실패 1명 -> 실패
+            if crit_fail_count >= 1: return "FAILURE"
+            
+            # 대성공 체크 (2명 이상 -> 대성공)
+            if crit_success_count >= 2: return "CRITICAL_SUCCESS"
+            
+            # 특수 케이스 (대성공1, 성공1, 실패1) -> 성공
+            normal_success = success_count - crit_success_count
+            fail_count = total - success_count
+            
+            if crit_success_count == 1 and normal_success == 1 and fail_count == 1:
+                return "SUCCESS"
+            
+            # 일반 성공 체크 (2명 이상 성공)
+            if success_count >= 2: return "SUCCESS"
+            
+            return "FAILURE"
+            
+        return "FAILURE"
+
+    @staticmethod
+    def resolve_combat_outcome(stat_type: str, result: str) -> dict:
+        """
+        전투 판정 결과에 따른 효과 반환
+        """
+        outcome = {
+            "hp": 0,
+            "sanity": 0,
+            "hunger": 0,
+            "pollution": 0,
+            "info": None,
+            "escape": False,
+            "group_escape": False,
+            "message": ""
+        }
+        
+        if result not in ["SUCCESS", "CRITICAL_SUCCESS"]:
+            outcome["message"] = "판정에 실패했습니다. 몬스터에게 압도당합니다."
+            return outcome
+
+        # 성공 시 효과
+        if stat_type == "perception": # 감각
+            outcome["sanity"] = -10
+            outcome["hp"] = -5
+            outcome["info"] = "monster_info"
+            outcome["message"] = "몬스터를 관찰하여 정보를 얻었지만, 정신적 충격과 부상을 입었습니다."
+            
+        elif stat_type == "intelligence": # 지식
+            outcome["pollution"] = 8
+            outcome["sanity"] = -10
+            outcome["hp"] = -8
+            outcome["info"] = "gimmick_info"
+            outcome["message"] = "몬스터의 기믹을 파악했지만, 오염되고 심각한 피해를 입었습니다."
+            
+        elif stat_type == "willpower": # 의지
+            outcome["hunger"] = -10
+            outcome["escape"] = True
+            outcome["message"] = "필사적으로 도망쳤습니다! (허기 감소)"
+            
+            if result == "CRITICAL_SUCCESS":
+                outcome["group_escape"] = True
+                outcome["message"] = "놀라운 기지로 동료들을 이끌고 완벽하게 도망쳤습니다! (전원 피해 없음)"
+            
+        return outcome

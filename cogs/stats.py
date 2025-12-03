@@ -36,49 +36,82 @@ class Stats(commands.Cog):
         self.bot = bot
         self.sheets = SheetsManager()
 
-    @app_commands.command(name="상태", description="캐릭터의 모든 상태 정보를 확인합니다.")
-    async def status(self, interaction: discord.Interaction):
+    # Discord 명령어 핸들러
+    @app_commands.command(name="현재상태", description="캐릭터의 모든 상태 정보를 확인합니다.")
+    async def current_status(self, interaction: discord.Interaction):
         """
         통합된 상태 확인 명령어
         - 스탯 (감각, 지성, 의지)
         - 체력, 정신력, 허기
         - 광기 목록
+        - 인벤토리
         - 단서 목록 (버튼으로 확인)
         """
+        logger.info(f"[현재상태] 명령어 시작 - 사용자: {interaction.user.display_name} (ID: {interaction.user.id})")
         await interaction.response.defer()
         
         # 스탯 조회
-        stats = self.sheets.get_user_stats(nickname=interaction.user.display_name, discord_id=str(interaction.user.id))
+        logger.debug(f"[현재상태] 스탯 조회 시작 - Discord ID: {interaction.user.id}")
+        stats = await self.sheets.get_user_stats_async(discord_id=str(interaction.user.id), nickname=interaction.user.display_name)
         
         if not stats:
+            logger.warning(f"[현재상태] 스탯 데이터 없음 - 사용자: {interaction.user.display_name} (ID: {interaction.user.id})")
             await interaction.followup.send(
                 f"❌ '{interaction.user.display_name}'님의 데이터를 찾을 수 없습니다. "
                 f"닉네임 형식을 확인하거나 메타데이터 시트에 등록해주세요.", 
                 ephemeral=True
             )
             return
-
-        # 정신력 반영 현재 스탯 계산
-        sanity_percent = stats['sanity'] / 100.0 if stats['sanity'] > 0 else 0
-        current_perception = GameLogic.calculate_current_stat(stats['perception'], sanity_percent)
-        current_intelligence = GameLogic.calculate_current_stat(stats['intelligence'], sanity_percent)
-        current_willpower = GameLogic.calculate_current_stat(stats['willpower'], sanity_percent)
+        
+        logger.info(f"[현재상태] 스탯 조회 성공 - 이름: {stats['name']}, HP: {stats['hp']}, Sanity: {stats['sanity']}")
 
         # DB에서 허기 및 광기 로드
-        db = self.bot.get_cog("Survival").db
-        user_state = db.fetch_one("SELECT current_hunger FROM user_state WHERE user_id = ?", (interaction.user.id,))
+        db = self.bot.db_manager
+        logger.debug(f"[현재상태] DB에서 user_state 조회 시작 - User ID: {interaction.user.id}")
+        user_state = await db.fetch_one("SELECT current_hunger, hunger_zero_days FROM user_state WHERE user_id = ?", (interaction.user.id,))
+        
         current_hunger = user_state[0] if user_state else 100
+        hunger_zero_days = user_state[1] if user_state else 0
+        logger.debug(f"[현재상태] 허기 정보 - current_hunger: {current_hunger}, hunger_zero_days: {hunger_zero_days}")
         
-        madness_list = db.fetch_all("SELECT madness_name FROM user_madness WHERE user_id = ?", (interaction.user.id,))
+        # 정신력 반영 현재 스탯 계산
+        sanity_percent = stats['sanity'] / 100.0 if stats['sanity'] > 0 else 0
+        logger.debug(f"[현재상태] 정신력 비율 계산 - sanity_percent: {sanity_percent:.2%}")
+        
+        # 허기 페널티 적용 스탯 계산
+        logger.debug(f"[현재상태] 허기 페널티 계산 전 - Perception: {stats['perception']}, Intelligence: {stats['intelligence']}, Willpower: {stats['willpower']}")
+        base_perception = GameLogic.calculate_hunger_penalty(stats['perception'], hunger_zero_days)
+        base_intelligence = GameLogic.calculate_hunger_penalty(stats['intelligence'], hunger_zero_days)
+        base_willpower = GameLogic.calculate_hunger_penalty(stats['willpower'], hunger_zero_days)
+        logger.debug(f"[현재상태] 허기 페널티 적용 후 - Perception: {base_perception}, Intelligence: {base_intelligence}, Willpower: {base_willpower}")
+        
+        current_perception = GameLogic.calculate_current_stat(base_perception, sanity_percent)
+        current_intelligence = GameLogic.calculate_current_stat(base_intelligence, sanity_percent)
+        current_willpower = GameLogic.calculate_current_stat(base_willpower, sanity_percent)
+        logger.debug(f"[현재상태] 정신력 반영 최종 스탯 - Perception: {current_perception}, Intelligence: {current_intelligence}, Willpower: {current_willpower}")
+
+        # 광기 목록 로드
+        logger.debug(f"[현재상태] 광기 목록 조회 시작 - User ID: {interaction.user.id}")
+        madness_list = await db.fetch_all("SELECT madness_name FROM user_madness WHERE user_id = ?", (interaction.user.id,))
         madness_names = ", ".join([m[0] for m in madness_list]) if madness_list else "없음"
+        logger.debug(f"[현재상태] 광기 목록 ({len(madness_list)}개) - {madness_names}")
         
+        # 인벤토리 로드
+        logger.debug(f"[현재상태] 인벤토리 조회 시작 - User ID: {interaction.user.id}")
+        items = await db.fetch_all("SELECT item_name, count FROM user_inventory WHERE user_id = ?", (interaction.user.id,))
+        items_str = ", ".join([f"{i[0]} x{i[1]}" for i in items]) if items else "없음"
+        logger.debug(f"[현재상태] 인벤토리 ({len(items)}개 아이템) - {items_str}")
+
         # 단서 로드 (버튼용)
-        clues = db.fetch_all(
+        logger.debug(f"[현재상태] 단서 목록 조회 시작 - User ID: {interaction.user.id}")
+        clues = await db.fetch_all(
             "SELECT clue_name, acquired_at FROM user_clues WHERE user_id = ? ORDER BY acquired_at DESC",
             (interaction.user.id,)
         )
+        logger.debug(f"[현재상태] 단서 목록 ({len(clues)}개 단서) 조회 완료")
 
         # 임베드 생성
+        logger.debug(f"[현재상태] Embed 생성 시작")
         embed = discord.Embed(title=f"📊 {stats['name']}님의 상태", color=0x3498db)
         
         # 기본 상태
@@ -86,30 +119,40 @@ class Stats(commands.Cog):
         embed.add_field(name="🧠 정신력 (Sanity)", value=f"{stats['sanity']}%", inline=True)
         embed.add_field(name="🍞 허기 (Hunger)", value=f"{current_hunger}/50", inline=True)
 
-        # 스탯
+        # 스탯 페널티 표시 로직
+        def format_stat(current, base_original):
+            if current < base_original:
+                logger.debug(f"[현재상태] 스탯 페널티 표시 - Current: {current}, Original: {base_original}")
+                return f"**{current}** (🔻{base_original})"
+            return f"**{current}**"
+
         embed.add_field(
             name="👁️ 감각 (Perception)", 
-            value=f"**{current_perception}** (기본: {stats['perception']})", 
+            value=format_stat(current_perception, stats['perception']), 
             inline=True
         )
         embed.add_field(
             name="🧩 지성 (Intelligence)", 
-            value=f"**{current_intelligence}** (기본: {stats['intelligence']})", 
+            value=format_stat(current_intelligence, stats['intelligence']), 
             inline=True
         )
         embed.add_field(
             name="💪 의지 (Willpower)", 
-            value=f"**{current_willpower}** (기본: {stats['willpower']})", 
+            value=format_stat(current_willpower, stats['willpower']), 
             inline=True
         )
         
         # 광기
         embed.add_field(name="🎭 보유 광기", value=madness_names, inline=False)
         
+        # 인벤토리
+        embed.add_field(name="🎒 인벤토리", value=items_str, inline=False)
+        
         # 허기 관련 정보
-        willpower = stats['willpower']
+        willpower = base_willpower
         decay = 10 + (willpower * 0.04)
         days_left = current_hunger / decay if decay > 0 else 999
+        logger.debug(f"[현재상태] 허기 계산 - decay: {decay:.1f}, days_left: {days_left:.1f}")
         embed.add_field(
             name="📉 허기 정보",
             value=f"일일 소모: {decay:.1f} | 예상 지속: {days_left:.1f}일",
@@ -117,8 +160,9 @@ class Stats(commands.Cog):
         )
         
         # 정신력 회복 정보
-        intelligence = stats['intelligence']
+        intelligence = base_intelligence
         threshold = 30 + (intelligence * 0.2)
+        logger.debug(f"[현재상태] 회복 임계값 계산 - threshold: {int(threshold)}")
         embed.add_field(
             name="🛌 회복 필요 허기",
             value=f"{int(threshold)} 이상 (정신력 회복 가능)",
@@ -126,23 +170,37 @@ class Stats(commands.Cog):
         )
         
         # 상태 메시지
+        logger.debug(f"[현재상태] 상태 이상 체크 시작")
         status_msg = []
         if stats['sanity'] <= 0:
             status_msg.append("⚠️ **광기 상태**: 정신력이 바닥났습니다.")
+            logger.warning(f"[현재상태] 광기 상태 감지 - Sanity: {stats['sanity']}")
         elif stats['sanity'] < 50:
             status_msg.append("⚠️ **불안**: 정신적으로 불안정합니다.")
+            logger.info(f"[현재상태] 불안 상태 감지 - Sanity: {stats['sanity']}")
         
         if current_hunger <= 0:
-            status_msg.append("⚠️ **굶주림**: 배가 너무 고파 쓰러지기 직전입니다.")
+            if hunger_zero_days >= 7:
+                status_msg.append("💀 **아사**: 굶주림으로 인해 행동불능 상태입니다.")
+                logger.error(f"[현재상태] 아사 상태 감지 - hunger_zero_days: {hunger_zero_days}")
+            elif hunger_zero_days >= 3:
+                status_msg.append(f"⚠️ **굶주림 ({hunger_zero_days}일차)**: 몸이 쇠약해집니다. (스탯 -10%)")
+                logger.warning(f"[현재상태] 굶주림 상태 감지 - hunger_zero_days: {hunger_zero_days}")
+            else:
+                status_msg.append(f"⚠️ **배고픔 ({hunger_zero_days}일차)**: 배가 고파 몸이 무겁습니다. (스탯 -5%)")
+                logger.info(f"[현재상태] 배고픔 상태 감지 - hunger_zero_days: {hunger_zero_days}")
         elif current_hunger <= 10:
             status_msg.append("⚠️ **배고픔**: 배가 많이 고픕니다.")
+            logger.info(f"[현재상태] 저허기 상태 감지 - current_hunger: {current_hunger}")
         
         if status_msg:
             embed.add_field(name="⚠️ 상태 이상", value="\n".join(status_msg), inline=False)
+            logger.info(f"[현재상태] 상태 이상 {len(status_msg)}개 표시")
 
         # 단서 목록 버튼이 있는 View
         view = CluesView(clues)
         
+        logger.info(f"[현재상태] 명령어 완료 - 사용자: {stats['name']}")
         await interaction.followup.send(embed=embed, view=view)
 
     @app_commands.command(name="주사위", description="주사위를 굴립니다. 조사 중이라면 판정에 사용됩니다.")
@@ -186,7 +244,7 @@ class Stats(commands.Cog):
         # 판정이 있는 경우: 단순 스탯 판정
         await interaction.response.defer()
         
-        stats = self.sheets.get_user_stats(discord_id=str(interaction.user.id))
+        stats = await self.sheets.get_user_stats_async(discord_id=str(interaction.user.id), nickname=interaction.user.display_name)
         if not stats:
             await interaction.followup.send("❌ 스탯 정보를 불러올 수 없습니다.", ephemeral=True)
             return
@@ -195,9 +253,14 @@ class Stats(commands.Cog):
         base_stat_value = stats.get(stat_map.get(stat), 0)
         
         # 정신력 반영 등 기존 로직 수행
-        db = self.bot.get_cog("Survival").db
-        user_state = db.fetch_one("SELECT current_sanity FROM user_state WHERE user_id = ?", (interaction.user.id,))
+        db = self.bot.db_manager
+        user_state = await db.fetch_one("SELECT current_sanity, hunger_zero_days FROM user_state WHERE user_id = ?", (interaction.user.id,))
         sanity_percent = user_state[0] / 100.0 if user_state else 1.0
+        hunger_zero_days = user_state[1] if user_state else 0
+        
+        # 허기 페널티 적용
+        base_stat_value = GameLogic.calculate_hunger_penalty(base_stat_value, hunger_zero_days)
+        
         current_stat_value = GameLogic.calculate_current_stat(base_stat_value, sanity_percent)
         target_value = GameLogic.calculate_target_value(current_stat_value)
         
@@ -241,9 +304,9 @@ class Stats(commands.Cog):
                 return
             
             # Survival Cog의 eat_food 로직 호출
-            db = survival_cog.db
+            db = self.bot.db_manager
             
-            inventory_item = db.fetch_one(
+            inventory_item = await db.fetch_one(
                 "SELECT count FROM user_inventory WHERE user_id = ? AND item_name = ?",
                 (interaction.user.id, item_name)
             )
@@ -252,7 +315,7 @@ class Stats(commands.Cog):
                 await interaction.response.send_message("❌ 해당 아이템을 가지고 있지 않습니다.", ephemeral=True)
                 return
 
-            item_data = self.sheets.get_item_data(item_name)
+            item_data = await self.sheets.get_item_data_async(item_name)
             
             if not item_data:
                 recovery = 0
@@ -278,21 +341,21 @@ class Stats(commands.Cog):
                 
             new_hunger = min(MAX_HUNGER, state['hunger'] + recovery)
             
-            db.execute_query(
+            await db.execute_query(
                 """UPDATE user_state 
                    SET current_hunger = ?, hunger_zero_days = 0 
                    WHERE user_id = ?""",
                 (new_hunger, interaction.user.id)
             )
             
-            db.execute_query(
+            await db.execute_query(
                 """UPDATE user_inventory 
                    SET count = count - 1 
                    WHERE user_id = ? AND item_name = ?""",
                 (interaction.user.id, item_name)
             )
             
-            db.execute_query(
+            await db.execute_query(
                 "DELETE FROM user_inventory WHERE user_id = ? AND count <= 0",
                 (interaction.user.id,)
             )
@@ -305,7 +368,7 @@ class Stats(commands.Cog):
             # Survival Cog의 rest 로직 호출
             import datetime
             
-            db = survival_cog.db
+            db = self.bot.db_manager
             state = await survival_cog.get_user_state(interaction.user.id)
             
             if state['last_sanity_recovery']:
@@ -313,13 +376,20 @@ class Stats(commands.Cog):
                 if last_date == datetime.date.today():
                     await interaction.response.send_message("❌ 이미 오늘 휴식을 취했습니다.", ephemeral=True)
                     return
-
-            stats = self.sheets.get_user_stats(discord_id=str(interaction.user.id))
+            
+            stats = await self.sheets.get_user_stats_async(discord_id=str(interaction.user.id), nickname=interaction.user.display_name)
             if not stats:
                 await interaction.response.send_message("❌ 스탯 정보를 불러올 수 없습니다.", ephemeral=True)
                 return
+            
+            # hunger_zero_days 조회
+            user_state = await db.fetch_one("SELECT hunger_zero_days FROM user_state WHERE user_id = ?", (interaction.user.id,))
+            hunger_zero_days = user_state[0] if user_state else 0
+            
+            # 페널티 적용된 지성 사용
+            effective_intelligence = GameLogic.calculate_hunger_penalty(stats['intelligence'], hunger_zero_days)
 
-            threshold = 30 + (stats['intelligence'] * 0.2)
+            threshold = 30 + (effective_intelligence * 0.2)
             if state['hunger'] < threshold:
                 await interaction.response.send_message(
                     f"❌ 배가 너무 고파 휴식을 취할 수 없습니다. (필요 허기: {int(threshold)})", 
@@ -327,10 +397,12 @@ class Stats(commands.Cog):
                 )
                 return
 
-            recovery = 10 + (stats['willpower'] / 10)
+            # 페널티 적용된 의지 사용
+            effective_willpower = GameLogic.calculate_hunger_penalty(stats['willpower'], hunger_zero_days)
+            recovery = 10 + (effective_willpower / 10)
             new_sanity = min(100, state['sanity'] + recovery)
             
-            db.execute_query(
+            await db.execute_query(
                 "UPDATE user_state SET current_sanity = ?, last_sanity_recovery = CURRENT_TIMESTAMP WHERE user_id = ?",
                 (new_sanity, interaction.user.id)
             )

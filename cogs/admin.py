@@ -13,8 +13,8 @@ class Admin(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.sheets = SheetsManager()
-        # 봇 시작 시 초기 데이터 로드 (동기화)
-        self.bot.investigation_data = self.sheets.fetch_investigation_data()
+        # 봇 시작 시 초기 데이터 로드 (비동기)
+        self.bot.loop.create_task(self.perform_sync())
         self.sync_task.start()
 
     def cog_unload(self):
@@ -72,26 +72,27 @@ class Admin(commands.Cog):
         try:
             # 1. 시트 데이터 가져오기 & 캐시 저장
             # 메타데이터, 스탯, 조사 데이터 등을 모두 갱신
-            self.sheets.get_metadata_map() 
-            self.sheets.fetch_all_stats()
-            self.sheets.get_item_data("dummy") # 캐시 웜업용
-            self.sheets.get_madness_data()
+            await self.sheets.get_metadata_map_async() 
+            await self.sheets.fetch_all_stats_async()
+            await self.sheets.get_item_data_async("dummy") # 캐시 웜업용
+            await self.sheets.get_madness_data_async()
             
             # 조사 데이터 갱신 및 봇 인스턴스에 적용
-            data = self.sheets.fetch_investigation_data()
+            data = await self.sheets.fetch_investigation_data_async()
             self.bot.investigation_data = data
             
             # DB 동기화 (시트 -> DB 허기 정보 등)
-            survival_cog = self.bot.get_cog("Survival")
-            if survival_cog:
-                db_manager = survival_cog.db
-                self.sheets.sync_hunger_from_sheet(db_manager) # 시트 값 -> DB
-                self.sheets.sync_hunger_to_sheet(db_manager)   # DB 값 -> 시트 (양방향 싱크 고려)
+            # Admin cog doesn't have direct access to Survival cog's DB easily if not initialized
+            # But we can use self.bot.db_manager if available
+            db_manager = getattr(self.bot, 'db_manager', None)
+            if db_manager:
+                await self.sheets.sync_hunger_from_sheet_async(db_manager) # 시트 값 -> DB
+                await self.sheets.sync_hunger_to_sheet_async(db_manager)   # DB 값 -> 시트 (양방향 싱크 고려)
             else:
-                logger.warning("Survival Cog을 찾을 수 없습니다.")
+                logger.warning("DB Manager not found.")
 
             # 캐시 파일로 저장
-            self.sheets.save_cache()
+            await self.sheets.save_cache_async()
             
             return True
         except Exception as e:
@@ -125,7 +126,7 @@ class Admin(commands.Cog):
         sheet_latency = "측정 중..."
         try:
             start_time = datetime.datetime.now()
-            self.sheets.get_metadata_map()
+            await self.sheets.get_metadata_map_async()
             end_time = datetime.datetime.now()
             sheet_latency = f"{round((end_time - start_time).total_seconds() * 1000)}ms"
             sheet_status = "✅ 연결됨"
@@ -176,7 +177,7 @@ class Admin(commands.Cog):
         await interaction.response.defer(ephemeral=True)
         
         try:
-            self.sheets.initialize_worksheets()
+            await self.sheets.initialize_worksheets_async()
             await interaction.followup.send("✅ 워크시트 초기화 완료! 로그를 확인해주세요.", ephemeral=True)
         except Exception as e:
             await interaction.followup.send(f"❌ 워크시트 초기화 실패: {str(e)}", ephemeral=True)

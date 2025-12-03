@@ -1,4 +1,4 @@
-import sqlite3
+import aiosqlite
 import logging
 import datetime
 import json
@@ -9,18 +9,30 @@ logger = logging.getLogger('utils.database')
 class DatabaseManager:
     def __init__(self, db_path="game_data.db"):
         self.db_path = db_path
-        self.initialize_db()
+        self.pool = None
 
-    def get_connection(self):
-        return sqlite3.connect(self.db_path)
+    async def initialize(self):
+        """봇 시작 시 호출: DB 연결 생성 및 테이블 초기화"""
+        try:
+            self.pool = await aiosqlite.connect(self.db_path)
+            # Row Factory 설정 (딕셔너리처럼 접근 가능하게 하려면 aiosqlite.Row 사용 가능하나, 기존 코드 호환성을 위해 기본 튜플 유지)
+            # self.pool.row_factory = aiosqlite.Row 
+            await self.create_tables()
+            logger.info("DB Connection established.")
+        except Exception as e:
+            logger.error(f"Failed to initialize database: {e}")
+            raise
 
-    def initialize_db(self):
+    async def close(self):
+        """봇 종료 시 호출"""
+        if self.pool:
+            await self.pool.close()
+            logger.info("DB Connection closed.")
+
+    async def create_tables(self):
         """데이터베이스 테이블 초기화"""
-        conn = self.get_connection()
-        cursor = conn.cursor()
-
         # 1. 유저 상태 (user_state)
-        cursor.execute('''
+        await self.execute_query('''
         CREATE TABLE IF NOT EXISTS user_state (
             user_id INTEGER PRIMARY KEY,
             current_hp INTEGER DEFAULT 100,
@@ -36,7 +48,7 @@ class DatabaseManager:
         ''')
 
         # 2. 인벤토리 (user_inventory)
-        cursor.execute('''
+        await self.execute_query('''
         CREATE TABLE IF NOT EXISTS user_inventory (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
@@ -44,12 +56,12 @@ class DatabaseManager:
             item_name TEXT,
             count INTEGER DEFAULT 1,
             acquired_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(user_id, item_id)
+            UNIQUE(user_id, item_name)
         )
-        ''')
+        ''') # UNIQUE 제약조건 수정: item_id -> item_name (기존 코드 로직 반영)
 
         # 3. 단서 (user_clues)
-        cursor.execute('''
+        await self.execute_query('''
         CREATE TABLE IF NOT EXISTS user_clues (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
@@ -61,7 +73,7 @@ class DatabaseManager:
         ''')
 
         # 4. 광기 (user_madness)
-        cursor.execute('''
+        await self.execute_query('''
         CREATE TABLE IF NOT EXISTS user_madness (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
@@ -73,7 +85,7 @@ class DatabaseManager:
         ''')
 
         # 5. 사고 (user_thoughts)
-        cursor.execute('''
+        await self.execute_query('''
         CREATE TABLE IF NOT EXISTS user_thoughts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
@@ -87,7 +99,7 @@ class DatabaseManager:
         ''')
 
         # 6. 월드 트리거 (world_triggers)
-        cursor.execute('''
+        await self.execute_query('''
         CREATE TABLE IF NOT EXISTS world_triggers (
             trigger_id TEXT PRIMARY KEY,
             active BOOLEAN DEFAULT 0,
@@ -97,7 +109,7 @@ class DatabaseManager:
         ''')
 
         # 7. 월드 상태 (world_state)
-        cursor.execute('''
+        await self.execute_query('''
         CREATE TABLE IF NOT EXISTS world_state (
             key TEXT PRIMARY KEY,
             value TEXT,
@@ -106,7 +118,7 @@ class DatabaseManager:
         ''')
 
         # 8. 차단 지역 (blocked_locations)
-        cursor.execute('''
+        await self.execute_query('''
         CREATE TABLE IF NOT EXISTS blocked_locations (
             location_id TEXT PRIMARY KEY,
             blocked_by TEXT,
@@ -115,7 +127,7 @@ class DatabaseManager:
         ''')
 
         # 9. 조사 카운트 (investigation_counts)
-        cursor.execute('''
+        await self.execute_query('''
         CREATE TABLE IF NOT EXISTS investigation_counts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
@@ -128,7 +140,7 @@ class DatabaseManager:
         ''')
 
         # 10. 조사 세션 (investigation_sessions)
-        cursor.execute('''
+        await self.execute_query('''
         CREATE TABLE IF NOT EXISTS investigation_sessions (
             session_id TEXT PRIMARY KEY, -- Channel ID
             leader_id INTEGER,
@@ -141,7 +153,7 @@ class DatabaseManager:
         ''')
 
         # 11. 제거된 아이템 (removed_items)
-        cursor.execute('''
+        await self.execute_query('''
         CREATE TABLE IF NOT EXISTS removed_items (
             location_id TEXT,
             item_id TEXT,
@@ -151,40 +163,51 @@ class DatabaseManager:
         )
         ''')
 
-        conn.commit()
-        conn.close()
-        logger.info("Database initialized successfully.")
+        # 12. 창고 (warehouse)
+        await self.execute_query('''
+        CREATE TABLE IF NOT EXISTS warehouse (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_name TEXT,
+            item_type TEXT,
+            count INTEGER DEFAULT 0,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(item_name)
+        )
+        ''')
+        
+        logger.info("Database tables initialized.")
 
-    def execute_query(self, query, params=()):
-        """쿼리 실행 (INSERT, UPDATE, DELETE)"""
-        conn = self.get_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute(query, params)
-            conn.commit()
+    async def execute_query(self, query, params=()):
+        """비동기 쿼리 실행 (INSERT, UPDATE, DELETE)"""
+        if not self.pool:
+            raise Exception("Database not initialized. Call initialize() first.")
+            
+        async with self.pool.cursor() as cursor:
+            await cursor.execute(query, params)
+            await self.pool.commit()
             return cursor.lastrowid
-        except Exception as e:
-            logger.error(f"Query execution error: {e}")
-            raise
-        finally:
-            conn.close()
 
-    def fetch_one(self, query, params=()):
-        """단일 결과 조회"""
-        conn = self.get_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute(query, params)
-            return cursor.fetchone()
-        finally:
-            conn.close()
+    async def executemany(self, query, params_list):
+        """비동기 대량 쿼리 실행 (Batch Processing)"""
+        if not self.pool:
+            raise Exception("Database not initialized.")
+            
+        async with self.pool.cursor() as cursor:
+            await cursor.executemany(query, params_list)
+            await self.pool.commit()
 
-    def fetch_all(self, query, params=()):
-        """다중 결과 조회"""
-        conn = self.get_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute(query, params)
-            return cursor.fetchall()
-        finally:
-            conn.close()
+    async def fetch_one(self, query, params=()):
+        """비동기 단일 결과 조회"""
+        if not self.pool:
+            raise Exception("Database not initialized.")
+            
+        async with self.pool.execute(query, params) as cursor:
+            return await cursor.fetchone()
+
+    async def fetch_all(self, query, params=()):
+        """비동기 다중 결과 조회"""
+        if not self.pool:
+            raise Exception("Database not initialized.")
+            
+        async with self.pool.execute(query, params) as cursor:
+            return await cursor.fetchall()

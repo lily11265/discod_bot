@@ -50,6 +50,26 @@ class ConditionParser:
             
         return conditions
 
+    STAT_MAP = {
+        "힘": "strength", "근력": "strength",
+        "민첩": "dexterity",
+        "지능": "intelligence", "지식": "intelligence",
+        "건강": "constitution",
+        "외모": "appearance",
+        "의지": "willpower", "정신": "willpower",
+        "크기": "size",
+        "교육": "education",
+        "이동": "movement", "이동력": "movement",
+        "감각": "perception", "관찰": "perception"
+    }
+
+    RESOURCE_MAP = {
+        "체력": "hp", "HP": "hp",
+        "정신력": "sanity", "이성": "sanity", "SP": "sanity",
+        "허기": "hunger", "배고픔": "hunger",
+        "오염": "pollution", "감염": "pollution"
+    }
+
     @staticmethod
     def check_condition(condition, user_state, world_state):
         """
@@ -72,8 +92,6 @@ class ConditionParser:
             # 차단 트리거 (있으면 False)
             result = value in world_state.get('triggers', [])
             # block은 존재하면 "접근 불가"이므로, result가 True면 조건 불만족(False)이어야 함.
-            # 하지만 여기서는 "조건이 참인가?"만 판단하고, 상위 로직에서 block 처리.
-            # 통상적으로 block 조건은 "이 트리거가 없어야 한다"로 해석됨.
             result = not result 
             
         elif cond_type == 'item':
@@ -85,14 +103,16 @@ class ConditionParser:
             
         elif cond_type == 'stat':
             # 스탯 확인 (stat:감각:40 또는 stat:의지:30-70)
-            stat_name, req_val = value.split(':', 1)
+            stat_name_kor, req_val = value.split(':', 1)
+            stat_name = ConditionParser.STAT_MAP.get(stat_name_kor, stat_name_kor) # 매핑 없으면 그대로 사용
+            
             user_stat = user_state.get('stats', {}).get(stat_name, 0)
             
             if '-' in req_val:
                 min_val, max_val = map(int, req_val.split('-'))
                 result = min_val <= user_stat <= max_val
             else:
-                result = user_stat >= int(req_val)
+                result = user_stat >= int(req_val.strip('"\''))
                 
         elif cond_type == 'time':
             # 시간 확인 (time:22:00-06:00)
@@ -133,13 +153,8 @@ class ConditionParser:
             
         elif cond_type == 'count':
             # 횟수 제한 확인 (count:>1, count:0 등)
-            # world_state['interaction_counts'] = { 'unique_id': count }
-            # unique_id는 현재 평가 중인 아이템의 ID여야 함.
-            # world_state에 'current_item_id'가 있다고 가정.
             target_id = world_state.get('current_item_id')
             if not target_id:
-                # ID가 없으면 카운트 체크 불가 -> False (안전하게)
-                # 혹은 0으로 간주? 0으로 간주하는게 나을듯.
                 current_count = 0
             else:
                 counts = world_state.get('interaction_counts', {})
@@ -157,8 +172,11 @@ class ConditionParser:
             
         elif cond_type == 'cost':
             # 비용 확인 (cost:허기:10)
-            res_name, amount = value.split(':')
-            current_res = user_state.get(res_name, 0) # 허기, 체력, 정신력 등
+            res_name_kor, amount = value.split(':')
+            res_name = ConditionParser.RESOURCE_MAP.get(res_name_kor, res_name_kor)
+            
+            # user_state의 최상위 키에 리소스가 있다고 가정 (hp, sanity, hunger 등)
+            current_res = user_state.get(res_name, 0) 
             result = current_res >= int(amount)
             
         elif cond_type == 'language' or cond_type == 'skill':

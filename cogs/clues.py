@@ -10,6 +10,18 @@ logger = logging.getLogger('cogs.clues')
 class Clues(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+import discord
+from discord.ext import commands, tasks
+from discord import app_commands
+from utils.game_logic import GameLogic
+from utils.sheets import SheetsManager
+import logging
+
+logger = logging.getLogger('cogs.clues')
+
+class Clues(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
         self.sheets = SheetsManager()
         self.check_combinations_task.start()
     
@@ -20,15 +32,9 @@ class Clues(commands.Cog):
     async def check_combinations_task(self):
         """5분마다 모든 유저의 정보 조합 가능성 체크"""
         try:
-            # ✅ Survival Cog이 로드되었는지 확인
-            survival_cog = self.bot.get_cog("Survival")
-            if not survival_cog:
-                logger.warning("Survival Cog이 로드되지 않아 정보 조합 체크를 건너뜠니다.")
-                return
+            db = self.bot.db_manager
             
-            db = survival_cog.db
-            
-            users = db.fetch_all("SELECT DISTINCT user_id FROM user_clues")
+            users = await db.fetch_all("SELECT DISTINCT user_id FROM user_clues")
             
             for (user_id,) in users:
                 await self.check_user_combinations(user_id)
@@ -38,33 +44,19 @@ class Clues(commands.Cog):
     async def check_user_combinations(self, user_id):
         """
         유저의 단서 조합을 확인하고, 조건을 만족하면 새로운 단서나 아이템을 지급합니다.
-        
-        작동 원리:
-        1. DB에서 해당 유저가 보유한 모든 단서 ID를 가져옵니다.
-        2. Google Sheets(Sheet B)에서 정의된 '단서 조합 레시피' 목록을 가져옵니다.
-        3. 각 레시피에 대해 다음을 확인합니다:
-           - 유저가 레시피의 '필요 단서'를 모두 가지고 있는가?
-           - 유저가 이미 '결과물'(단서 또는 아이템)을 가지고 있지 않은가? (중복 지급 방지)
-        4. 조건을 만족하면:
-           - 결과물이 '단서'인 경우: DB의 user_clues 테이블에 추가합니다.
-           - 결과물이 '아이템'인 경우: DB의 user_inventory 테이블에 추가합니다.
-           - 유저에게 DM으로 성공 메시지(조합된 내용)를 보냅니다.
         """
         try:
             # 1. 유저가 보유한 단서 목록 조회 (DB)
-            # Survival Cog의 DB 인스턴스를 빌려옵니다.
-            survival_cog = self.bot.get_cog("Survival")
-            if not survival_cog: return
-            db = survival_cog.db
+            db = self.bot.db_manager
             
             # user_clues 테이블에서 user_id에 해당하는 모든 clue_id를 조회합니다.
-            user_clues_data = db.fetch_all("SELECT clue_id FROM user_clues WHERE user_id = ?", (user_id,))
+            user_clues_data = await db.fetch_all("SELECT clue_id FROM user_clues WHERE user_id = ?", (user_id,))
             # 조회된 튜플 리스트를 set으로 변환하여 검색 속도를 높입니다. (예: {'clue_A', 'clue_B'})
             user_clues = set(row[0] for row in user_clues_data)
             
             # 2. 단서 조합 레시피 조회 (Google Sheets)
             # SheetsManager를 통해 정의된 조합식을 가져옵니다.
-            recipes = self.sheets.get_clue_combinations()
+            recipes = await self.sheets.get_clue_combinations_async()
             
             # 3. 각 레시피 검사
             for recipe in recipes:
@@ -89,7 +81,7 @@ class Clues(commands.Cog):
                             continue # 이미 가지고 있으면 스킵
                             
                         # 보상 지급: 단서 추가
-                        db.execute_query(
+                        await db.execute_query(
                             "INSERT INTO user_clues (user_id, clue_id, clue_name) VALUES (?, ?, ?)",
                             (user_id, recipe['result_id'], recipe['result_id']) # 이름은 ID와 동일하게 처리하거나 별도 조회 필요
                         )
@@ -97,7 +89,7 @@ class Clues(commands.Cog):
                         
                     elif recipe['result_type'] == '아이템':
                         # 결과 아이템을 이미 가지고 있는지 확인 (인벤토리 조회)
-                        has_item = db.fetch_one(
+                        has_item = await db.fetch_one(
                             "SELECT count FROM user_inventory WHERE user_id = ? AND item_name = ?",
                             (user_id, recipe['result_id'])
                         )
@@ -105,7 +97,7 @@ class Clues(commands.Cog):
                             continue # 이미 가지고 있으면 스킵 (아이템은 중복 소지 가능하게 할지 기획에 따라 다르나, 보통 조합 이벤트는 1회성)
                         
                         # 보상 지급: 아이템 추가
-                        db.execute_query(
+                        await db.execute_query(
                             "INSERT INTO user_inventory (user_id, item_name, count) VALUES (?, ?, 1) "
                             "ON CONFLICT(user_id, item_name) DO UPDATE SET count = count + 1",
                             (user_id, recipe['result_id'])
@@ -133,13 +125,8 @@ class Clues(commands.Cog):
         """자신의 단서 목록 확인 (자신만 볼 수 있음)"""
         await interaction.response.defer(ephemeral=True)
         
-        survival_cog = self.bot.get_cog("Survival")
-        if not survival_cog:
-            await interaction.followup.send("시스템 오류: Survival Cog을 찾을 수 없습니다.", ephemeral=True)
-            return
-
-        db = survival_cog.db
-        clues = db.fetch_all("SELECT clue_id FROM user_clues WHERE user_id = ?", (interaction.user.id,))
+        db = self.bot.db_manager
+        clues = await db.fetch_all("SELECT clue_id FROM user_clues WHERE user_id = ?", (interaction.user.id,))
         
         if not clues:
             await interaction.followup.send("획득한 단서가 없습니다.", ephemeral=True)
